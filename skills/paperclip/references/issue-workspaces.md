@@ -69,6 +69,84 @@ After `start` or `restart`, read the service URL from:
 
 For QA/browser checks, use the service whose `status` is `running` and whose `healthStatus` is not `unhealthy`. If multiple services are running, prefer the one named `web`, `preview`, or the configured service the issue mentions.
 
+## Invoke a Narrow Runtime Broker
+
+Use a runtime broker when an agent needs a read-only operation from an issue-bound
+loopback service but must not receive a generic service URL, arbitrary navigation,
+or raw response headers. The board configures the service command and its broker
+allowlist; agent keys cannot add or change host-executed runtime commands.
+
+Example service command fragment:
+
+```json
+{
+  "id": "member-broker",
+  "kind": "service",
+  "command": "node broker.mjs",
+  "port": { "type": "auto" },
+  "readiness": { "type": "http", "urlTemplate": "http://127.0.0.1:${port}/health" },
+  "expose": { "type": "url", "urlTemplate": "http://127.0.0.1:${port}" },
+  "broker": {
+    "enabled": true,
+    "operations": [{
+      "id": "member-smoke",
+      "method": "POST",
+      "path": "/v1/smoke",
+      "readOnly": true,
+      "agentIds": ["<allowed-agent-uuid>"],
+      "issueIds": ["<bound-issue-uuid>"],
+      "requiredFields": ["target", "viewport"],
+      "payloadAllowlist": {
+        "target": ["fixed-target-a", "fixed-target-b"],
+        "viewport": ["desktop", "mobile"]
+      },
+      "auditFields": ["target", "viewport"],
+      "maxResponseBytes": 2097152,
+      "timeoutMs": 30000
+    }]
+  }
+}
+```
+
+Invoke the named operation rather than passing a URL or method:
+
+```sh
+curl -sS -X POST \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+  -H "Content-Type: application/json" \
+  "$PAPERCLIP_API_URL/api/execution-workspaces/<workspace-id>/runtime-broker/member-broker/member-smoke" \
+  -d '{"target":"fixed-target-a","viewport":"desktop"}'
+```
+
+The gateway requires an authenticated agent run, the exact actor and issue
+allowlists, an active healthy service, and a loopback `http://` service URL. It
+rejects unlisted fields/values and non-read-only methods, injects verified
+issue/run/actor context server-side, accepts JSON responses only, enforces a byte
+limit, drops upstream headers, recursively redacts secret-like response keys, and
+records a narrow activity audit without the request body.
+
+For browser-backed read-only checks, the repository includes
+`scripts/smoke/issue-browser-session-broker.mjs`. Configure it with an exact
+issue id, agent id, SID/URL map, a profile path ending in
+`.paperclip-browser-sessions/<issue-id>`, and `PURGE_ON_STOP=true`. The broker:
+
+- binds only to loopback;
+- accepts only `POST /v1/smoke` plus `GET /health`;
+- re-verifies the gateway-injected issue/run/actor context and exact target;
+- blocks non-GET/HEAD/OPTIONS browser requests;
+- returns screenshots, structural DOM/iframe data, console errors, and redacted
+  network metadata without headers or bodies;
+- reports `interactive_auth_required` when the isolated profile reaches an auth
+  page; and
+- deletes the issue-scoped browser profile when the managed service stops with
+  purge enabled.
+
+The script never accepts credentials or session material through its API. If the
+target requires a fresh interactive login, use a separate board-controlled
+session-provisioning gate; do not pass a password, cookie, storage-state export,
+or magic-link token through an issue, agent run, broker request, or attachment.
+
 ## MCP Tools
 
 When the Paperclip MCP tools are available, prefer these issue-scoped tools:

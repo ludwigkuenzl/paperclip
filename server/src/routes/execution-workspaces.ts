@@ -35,6 +35,13 @@ import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-ru
 import { appendWithCap } from "../adapters/utils.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import {
+  invokeRuntimeBroker,
+  readRuntimeBrokerOperation,
+  RuntimeBrokerPolicyError,
+  selectRuntimeBrokerAuditFields,
+  validateRuntimeBrokerInvocation,
+} from "../services/workspace-runtime-broker.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 
@@ -477,8 +484,139 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     });
   }
 
+  async function handleExecutionWorkspaceBrokerInvoke(req: Request, res: Response) {
+    const id = req.params.id as string;
+    const workspaceCommandId = String(req.params.workspaceCommandId ?? "").trim();
+    const operationId = String(req.params.operationId ?? "").trim();
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
+    if (!existing) return;
+    if (!(await assertRuntimeManageAllowed(req, res, existing.companyId))) return;
+
+    await assertCanManageExecutionWorkspaceRuntimeServices(db, req, {
+      companyId: existing.companyId,
+      executionWorkspaceId: existing.id,
+      sourceIssueId: existing.sourceIssueId,
+    });
+
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.runId) {
+      res.status(403).json({ error: "Runtime broker requires an authenticated agent run", code: "agent_run_required" });
+      return;
+    }
+    if (!existing.sourceIssueId) {
+      res.status(422).json({ error: "Runtime broker requires an issue-bound execution workspace", code: "issue_binding_required" });
+      return;
+    }
+
+    const projectWorkspace = existing.projectWorkspaceId
+      ? await db
+          .select({ metadata: projectWorkspaces.metadata })
+          .from(projectWorkspaces)
+          .where(
+            and(
+              eq(projectWorkspaces.id, existing.projectWorkspaceId),
+              eq(projectWorkspaces.companyId, existing.companyId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const inheritedRuntimeConfig = readProjectWorkspaceRuntimeConfig(
+      (projectWorkspace?.metadata as Record<string, unknown> | null) ?? null,
+    )?.workspaceRuntime ?? null;
+    const effectiveRuntimeConfig = existing.config?.workspaceRuntime ?? inheritedRuntimeConfig;
+    const workspaceCommand = effectiveRuntimeConfig
+      ? findWorkspaceCommandDefinition(effectiveRuntimeConfig, workspaceCommandId)
+      : null;
+    if (!workspaceCommand || workspaceCommand.kind !== "service") {
+      res.status(404).json({ error: "Runtime broker service command not found", code: "service_command_not_found" });
+      return;
+    }
+    const runtimeService = matchWorkspaceRuntimeServiceToCommand(workspaceCommand, existing.runtimeServices ?? []);
+    if (
+      !runtimeService
+      || runtimeService.status !== "running"
+      || runtimeService.healthStatus === "unhealthy"
+      || !runtimeService.url
+    ) {
+      res.status(409).json({ error: "Runtime broker service is not healthy and running", code: "service_not_ready" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const context = {
+      actorAgentId: req.actor.agentId,
+      issueId: existing.sourceIssueId,
+      runId: req.actor.runId,
+      operationId,
+    };
+    let auditFields: Record<string, unknown> = {};
+    let outcome = "denied";
+    let outcomeCode: string | null = null;
+    let upstreamStatus: number | null = null;
+    try {
+      const operation = readRuntimeBrokerOperation(workspaceCommand.rawConfig, operationId);
+      const payload = validateRuntimeBrokerInvocation({ operation, context, payload: req.body });
+      auditFields = selectRuntimeBrokerAuditFields(operation, payload);
+      const result = await invokeRuntimeBroker({
+        serviceUrl: runtimeService.url,
+        serviceConfig: workspaceCommand.rawConfig,
+        context,
+        payload,
+      });
+      outcome = result.status >= 200 && result.status < 400 ? "succeeded" : "upstream_rejected";
+      upstreamStatus = result.status;
+      res.status(result.status).json({
+        issueId: existing.sourceIssueId,
+        runId: req.actor.runId,
+        actorAgentId: req.actor.agentId,
+        operationId,
+        result: result.body,
+      });
+    } catch (error) {
+      if (error instanceof RuntimeBrokerPolicyError) {
+        outcomeCode = error.code;
+        res.status(error.status).json({ error: error.message, code: error.code });
+      } else {
+        outcome = "failed";
+        outcomeCode = "broker_upstream_unavailable";
+        logger.warn({
+          executionWorkspaceId: existing.id,
+          issueId: existing.sourceIssueId,
+          operationId,
+          actorAgentId: req.actor.agentId,
+        }, "runtime broker upstream invocation failed");
+        res.status(502).json({ error: "Runtime broker upstream invocation failed", code: outcomeCode });
+      }
+    } finally {
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "execution_workspace.runtime_broker_invoked",
+        entityType: "execution_workspace",
+        entityId: existing.id,
+        details: {
+          executionWorkspaceId: existing.id,
+          issueId: existing.sourceIssueId,
+          workspaceCommandId,
+          runtimeServiceId: runtimeService.id,
+          operationId,
+          outcome,
+          outcomeCode,
+          upstreamStatus,
+          audit: auditFields,
+        },
+      });
+    }
+  }
+
   router.post("/execution-workspaces/:id/runtime-services/:action", validate(workspaceRuntimeControlTargetSchema), handleExecutionWorkspaceRuntimeCommand);
   router.post("/execution-workspaces/:id/runtime-commands/:action", validate(workspaceRuntimeControlTargetSchema), handleExecutionWorkspaceRuntimeCommand);
+  router.post(
+    "/execution-workspaces/:id/runtime-broker/:workspaceCommandId/:operationId",
+    handleExecutionWorkspaceBrokerInvoke,
+  );
 
   router.post("/execution-workspaces/:id/reconcile-branch", validate(reconcileExecutionWorkspaceBranchSchema), async (req, res) => {
     const id = req.params.id as string;

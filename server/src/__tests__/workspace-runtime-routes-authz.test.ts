@@ -200,6 +200,7 @@ describe.sequential("workspace runtime service route authorization", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       action: "company_scope:read",
@@ -410,6 +411,32 @@ describe.sequential("workspace runtime service route authorization", () => {
     expect(mockProjectService.create).not.toHaveBeenCalled();
   });
 
+  it("rejects agent callers that create project runtime service commands", async () => {
+    const app = await createProjectApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/projects")
+      .send({
+        name: "Exploit through project runtime",
+        executionWorkspacePolicy: {
+          enabled: true,
+          workspaceRuntime: {
+            commands: [{ id: "web", kind: "service", command: "touch /tmp/project-runtime-rce" }],
+          },
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("executionWorkspacePolicy.workspaceRuntime.commands[0].command");
+    expect(mockProjectService.create).not.toHaveBeenCalled();
+  });
+
   it("rejects agent callers that update project workspace cleanup commands", async () => {
     mockProjectService.getById.mockResolvedValue(buildProject());
     const app = await createProjectApp({
@@ -428,6 +455,31 @@ describe.sequential("workspace runtime service route authorization", () => {
 
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("host-executed workspace commands");
+    expect(mockProjectService.updateWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("rejects agent callers that update project workspace runtime service commands", async () => {
+    mockProjectService.getById.mockResolvedValue(buildProject());
+    const app = await createProjectApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .patch(`/api/projects/${projectId}/workspaces/${workspaceId}`)
+      .send({
+        runtimeConfig: {
+          workspaceRuntime: {
+            services: [{ command: "touch /tmp/project-workspace-runtime-rce" }],
+          },
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("runtimeConfig.workspaceRuntime.services[0].command");
     expect(mockProjectService.updateWorkspace).not.toHaveBeenCalled();
   });
 
@@ -496,6 +548,163 @@ describe.sequential("workspace runtime service route authorization", () => {
     expect(res.body.error).toContain("host-executed workspace commands");
     expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
   });
+
+  it("rejects agent callers that patch execution workspace runtime service commands", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue(buildExecutionWorkspace({ id: executionWorkspaceId }));
+    const app = await createExecutionWorkspaceApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .patch(`/api/execution-workspaces/${executionWorkspaceId}`)
+      .send({
+        config: {
+          workspaceRuntime: {
+            jobs: [{ command: "touch /tmp/execution-workspace-runtime-rce" }],
+          },
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("config.workspaceRuntime.jobs[0].command");
+    expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+  });
+
+  it("invokes an issue-bound runtime broker only for its exact agent allowlist and redacts upstream secrets", async () => {
+    const allowedAgentId = "00000000-0000-4000-8000-000000000001";
+    const issueId = "00000000-0000-4000-8000-000000000002";
+    const command = {
+      id: "member-broker",
+      kind: "service",
+      name: "Member broker",
+      command: "node broker.mjs",
+      broker: {
+        enabled: true,
+        operations: [{
+          id: "member-smoke",
+          method: "POST",
+          path: "/v1/smoke",
+          readOnly: true,
+          agentIds: [allowedAgentId],
+          issueIds: [issueId],
+          requiredFields: ["sid"],
+          payloadAllowlist: { sid: ["member-a", "member-b"] },
+          auditFields: ["sid"],
+        }],
+      },
+    };
+    mockExecutionWorkspaceService.getById.mockResolvedValue(buildExecutionWorkspace({
+      id: executionWorkspaceId,
+      sourceIssueId: issueId,
+      config: { workspaceRuntime: { commands: [command] } },
+      runtimeServices: [{
+        id: "runtime-service-1",
+        serviceName: "Member broker",
+        command: "node broker.mjs",
+        cwd: "/tmp/workspace",
+        status: "running",
+        healthStatus: "healthy",
+        url: "http://127.0.0.1:43111",
+      }],
+    }));
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      requestHeaders: { authorization: "Bearer must-not-leak" },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchImpl);
+    const app = await createExecutionWorkspaceApp({
+      type: "agent",
+      agentId: allowedAgentId,
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "300fd7ec-9b55-48cf-9714-3def0d4e05c2",
+    });
+
+    const res = await request(app)
+      .post(`/api/execution-workspaces/${executionWorkspaceId}/runtime-broker/member-broker/member-smoke`)
+      .send({ sid: "member-a" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      issueId,
+      actorAgentId: allowedAgentId,
+      operationId: "member-smoke",
+      result: { ok: true, requestHeaders: "[REDACTED]" },
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "http://127.0.0.1:43111/v1/smoke",
+      expect.objectContaining({ method: "POST", redirect: "error" }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "execution_workspace.runtime_broker_invoked",
+        details: expect.objectContaining({
+          issueId,
+          outcome: "succeeded",
+          audit: { sid: "member-a" },
+        }),
+      }),
+    );
+  }, 15000);
+
+  it("rejects a foreign agent before the issue-bound broker reaches its upstream", async () => {
+    const issueId = "00000000-0000-4000-8000-000000000002";
+    const command = {
+      id: "member-broker",
+      kind: "service",
+      name: "Member broker",
+      command: "node broker.mjs",
+      broker: {
+        enabled: true,
+        operations: [{
+          id: "member-smoke",
+          method: "POST",
+          path: "/v1/smoke",
+          readOnly: true,
+          agentIds: ["00000000-0000-4000-8000-000000000001"],
+          issueIds: [issueId],
+          requiredFields: ["sid"],
+          payloadAllowlist: { sid: ["member-a"] },
+        }],
+      },
+    };
+    mockExecutionWorkspaceService.getById.mockResolvedValue(buildExecutionWorkspace({
+      id: executionWorkspaceId,
+      sourceIssueId: issueId,
+      config: { workspaceRuntime: { commands: [command] } },
+      runtimeServices: [{
+        id: "runtime-service-1",
+        serviceName: "Member broker",
+        command: "node broker.mjs",
+        cwd: "/tmp/workspace",
+        status: "running",
+        healthStatus: "healthy",
+        url: "http://127.0.0.1:43111",
+      }],
+    }));
+    const fetchImpl = vi.fn();
+    vi.stubGlobal("fetch", fetchImpl);
+    const app = await createExecutionWorkspaceApp({
+      type: "agent",
+      agentId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "300fd7ec-9b55-48cf-9714-3def0d4e05c2",
+    });
+
+    const res = await request(app)
+      .post(`/api/execution-workspaces/${executionWorkspaceId}/runtime-broker/member-broker/member-smoke`)
+      .send({ sid: "member-a" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("actor_forbidden");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  }, 15000);
 
   it("rejects agent callers that smuggle execution workspace commands through metadata.config", async () => {
     mockExecutionWorkspaceService.getById.mockResolvedValue(buildExecutionWorkspace({ id: executionWorkspaceId }));

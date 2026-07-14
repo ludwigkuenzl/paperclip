@@ -4075,6 +4075,30 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "post",
+  path: "/api/execution-workspaces/{id}/runtime-broker/{workspaceCommandId}/{operationId}",
+  tags: ["execution-workspaces"],
+  summary: "Invoke an allowlisted read-only operation on an issue-bound loopback runtime service",
+  request: {
+    params: z.object({
+      id: z.string(),
+      workspaceCommandId: z.string(),
+      operationId: z.string(),
+    }),
+    body: jsonBody(z.record(z.string(), z.unknown())),
+  },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+    502: r.serverError,
+  },
+});
+
 // ─── Environments ─────────────────────────────────────────────────────────────
 
 registry.registerPath({
