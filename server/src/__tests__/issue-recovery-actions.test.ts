@@ -24,6 +24,8 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueService } from "../services/issues.js";
+import { SUCCESSFUL_RUN_MISSING_STATE_REASON } from "../services/recovery/index.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -229,6 +231,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return app;
   }
 
+  async function withLifecycleEnforce<T>(companyId: string, task: () => Promise<T>) {
+    const originalMode = process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT;
+    const originalCompanies = process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS;
+    try {
+      process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+      process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS = companyId;
+      return await task();
+    } finally {
+      if (originalMode === undefined) delete process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT;
+      else process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = originalMode;
+      if (originalCompanies === undefined) delete process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS;
+      else process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS = originalCompanies;
+    }
+  }
+
   it("upserts one active source-scoped action per issue and keeps company scoping explicit", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);
@@ -263,6 +280,102 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(second.evidence).toMatchObject({ latestRunId: "run-2" });
     expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: first.id });
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
+  });
+
+  it("rolls back source compensation and recovery action as one transaction", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const issuesSvc = issueService(db);
+    const recoveryActionSvc = issueRecoveryActionService(db);
+
+    await expect(db.transaction(async (tx) => {
+      const compensated = await issuesSvc.update(sourceIssueId, {
+        status: "blocked",
+        assigneeAgentId: coderId,
+      }, tx);
+      expect(compensated?.status).toBe("blocked");
+      await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "missing_disposition",
+        ownerType: "agent",
+        ownerAgentId: coderId,
+        previousOwnerAgentId: coderId,
+        returnOwnerAgentId: coderId,
+        cause: "handoff_wake_delivery_failed",
+        fingerprint: `handoff-wake-delivery-failed:${sourceIssueId}:rollback-test`,
+        nextAction: "Restore a confirmed wake.",
+        maxAttempts: 1,
+      }, tx);
+      throw new Error("force transaction rollback");
+    })).rejects.toThrow("force transaction rollback");
+
+    const [source] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(source).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+    });
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(actions).toHaveLength(0);
+  });
+
+  it("allows only an exact internal handoff rollback in enforce mode", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const issuesSvc = issueService(db);
+    await db
+      .update(issues)
+      .set({ status: "todo", assigneeAgentId: coderId })
+      .where(eq(issues.id, sourceIssueId));
+
+    await withLifecycleEnforce(companyId, async () => {
+      const committed = await issuesSvc.update(sourceIssueId, {
+        status: "in_progress",
+        assigneeAgentId: managerId,
+      });
+      expect(committed).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: managerId,
+      });
+
+      await expect(issuesSvc.update(sourceIssueId, {
+        status: "todo",
+        assigneeAgentId: coderId,
+      })).rejects.toThrow("does not allow transition in_progress -> todo");
+
+      await expect(issuesSvc.update(sourceIssueId, {
+        status: "todo",
+        assigneeAgentId: coderId,
+        lifecycleTransitionContext: {
+          handoffRollback: {
+            committedStatus: "todo",
+            previousStatus: "todo",
+          },
+        },
+      })).rejects.toThrow("does not allow transition in_progress -> todo");
+
+      const rolledBack = await issuesSvc.update(sourceIssueId, {
+        status: "todo",
+        assigneeAgentId: coderId,
+        lifecycleTransitionContext: {
+          handoffRollback: {
+            committedStatus: "in_progress",
+            previousStatus: "todo",
+          },
+        },
+      });
+      expect(rolledBack).toMatchObject({
+        status: "todo",
+        assigneeAgentId: coderId,
+      });
+    });
+
+    const [source] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(source).toMatchObject({
+      status: "todo",
+      assigneeAgentId: coderId,
+    });
   });
 
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
@@ -321,6 +434,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       issueId: sourceIssue.id,
       sourceIssueId: sourceIssue.id,
       recoveryCause: "stranded_assigned_issue",
+    });
+  });
+
+  it("retains the source owner when a failed handoff has a different recovery owner", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "corrective handoff did not set a disposition",
+      errorCode: "adapter_failed",
+      contextSnapshot: {
+        wakeReason: "finish_successful_run_handoff",
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+      },
+      livenessState: "needs_followup",
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "The bounded handoff correction was exhausted.",
+      recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      recoveryOwnerAgentId: managerId,
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "missing_disposition",
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(updatedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: coderId,
+    });
+    const [handoffActivity] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.successful_run_handoff_escalated"));
+    expect(handoffActivity?.details).toMatchObject({
+      lifecycleState: "handoff_failed",
+      previousOwnerRetained: true,
+      recoveryOwnerAgentId: managerId,
+      previousOwnerAgentId: coderId,
     });
   });
 
@@ -997,11 +1166,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("allows the named recovery owner to resolve a board-owned source recovery action", async () => {
-    const { companyId, managerId, sourceIssueId } = await seedCompany();
+  it("allows the named recovery owner to resolve a source retained by a different agent", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .set({ status: "blocked" })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -1031,19 +1200,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       issueId: sourceIssueId,
     });
 
-    const resolved = await request(app)
-      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
-      .send({
-        actionId: action.id,
-        outcome: "restored",
-        sourceIssueStatus: "done",
-        resolutionNote: "Recovery owner verified the work was intentionally completed.",
-      })
-      .expect(200);
+    const resolved = await withLifecycleEnforce(companyId, () => request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Recovery owner verified the work was intentionally completed.",
+        })
+        .expect(200));
 
     expect(resolved.body.issue).toMatchObject({
       id: sourceIssueId,
       status: "done",
+      assigneeAgentId: coderId,
       activeRecoveryAction: null,
     });
     expect(resolved.body.recoveryAction).toMatchObject({
@@ -1195,7 +1365,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   it("allows false-positive recovery resolution to restore a blocked source issue in the same request", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
-    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
       companyId,
@@ -1211,15 +1384,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     const app = createApp();
 
-    const resolved = await request(app)
-      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
-      .send({
-        actionId: action.id,
-        outcome: "false_positive",
-        sourceIssueStatus: "in_review",
-        resolutionNote: "Recovery signal was stale; return to review.",
-      })
-      .expect(200);
+    const resolved = await withLifecycleEnforce(companyId, () => request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "false_positive",
+          sourceIssueStatus: "in_review",
+          resolutionNote: "Recovery signal was stale; return to review.",
+        })
+        .expect(200));
 
     expect(resolved.body.issue).toMatchObject({
       id: sourceIssueId,
@@ -1271,5 +1444,44 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  it("rejects a contract-invalid status edge for an allowlisted enforce company", async () => {
+    const { companyId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, sourceIssueId));
+    const originalMode = process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT;
+    const originalCompanies = process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS;
+    try {
+      process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+      process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS = companyId;
+
+      const rejected = await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ status: "done" })
+        .expect(409);
+
+      expect(rejected.body.error).toContain("does not allow transition backlog -> done");
+      const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(sourceIssue?.status).toBe("backlog");
+    } finally {
+      if (originalMode === undefined) delete process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT;
+      else process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = originalMode;
+      if (originalCompanies === undefined) delete process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS;
+      else process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS = originalCompanies;
+    }
+  });
+
+  it("rejects guarded blocked completion outside an active recovery resolution", async () => {
+    const { companyId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+
+    const rejected = await withLifecycleEnforce(companyId, () => request(createApp())
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "done" })
+      .expect(409));
+
+    expect(rejected.body.error).toContain("requires an active recovery resolution");
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("blocked");
   });
 });

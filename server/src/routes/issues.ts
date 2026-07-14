@@ -48,6 +48,7 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -143,6 +144,10 @@ import {
   buildIssueBlockersResolvedWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWake,
 } from "../services/issue-dependency-wakeups.js";
+import {
+  resolveIssueLifecycleEnforcementModeForCompany,
+  shouldEmitStructuralParentWake,
+} from "../services/issue-lifecycle-enforcement.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { feedbackService } from "../services/feedback.js";
@@ -639,14 +644,24 @@ async function buildIssueWorkspaceChangeActivityDetails(
   };
 }
 
-function hasExecutionParticipant(value: unknown) {
-  const state = parseIssueExecutionState(value);
-  if (!state || state.status !== "pending") return false;
-  const participant = state.currentParticipant;
+function executionParticipantProvidesDeliveredReviewPath(input: {
+  previousValue: unknown;
+  nextValue: unknown;
+}) {
+  const nextState = parseIssueExecutionState(input.nextValue);
+  if (!nextState || nextState.status !== "pending") return false;
+  const participant = nextState.currentParticipant;
   if (!participant) return false;
-  if (participant.type === "agent") return Boolean(participant.agentId);
   if (participant.type === "user") return Boolean(participant.userId);
-  return false;
+  if (participant.type !== "agent" || !participant.agentId) return false;
+
+  // Agent participants are a delivered path only when this mutation will
+  // enqueue their stage wake. A stale participant value by itself is metadata,
+  // not proof that anyone owns the next action.
+  const previousState = parseIssueExecutionState(input.previousValue);
+  return previousState?.status !== "pending" ||
+    previousState.currentStageId !== nextState.currentStageId ||
+    !executionPrincipalsEqual(previousState.currentParticipant ?? null, participant);
 }
 
 function hasScheduledMonitor(input: {
@@ -685,6 +700,7 @@ function successfulRunHandoffStateFromActivity(row: {
 
   return {
     state,
+    lifecycleState: state === "escalated" ? "handoff_failed" : null,
     required: state === "required",
     sourceRunId:
       readNonEmptyString(details.sourceRunId)
@@ -1503,11 +1519,11 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
 
 const ACTIVE_REVIEW_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
 
-const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
-  "invalid_issue_disposition: Agent-authored updates that move an issue to in_review must include a real review path. " +
+const INVALID_IN_REVIEW_DISPOSITION_MESSAGE =
+  "invalid_issue_disposition: Updates that move an issue to in_review must include a real review path. " +
   "This request would leave the issue in_review without anyone or anything owning the next action. " +
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
-  "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
+  "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy so its reviewer wake is queued, " +
   "or schedule an issue monitor for an external review/check. After creating one of those review paths, retry the status update.";
 
 function executionPrincipalsEqual(
@@ -2616,6 +2632,24 @@ export function issueRoutes(
   };
   const feedbackExportService = opts?.feedbackExportService;
   const environmentsSvc = environmentService(db);
+  async function logIssueLifecycleActivity(input: Parameters<typeof logActivity>[1]) {
+    try {
+      await logActivity(db, input);
+    } catch (err) {
+      // Instrumentation must never become the mutation or wake gate. Shadow
+      // mode promises compatibility, and enforce mode must apply the invariant
+      // even when activity persistence is temporarily unavailable.
+      logger.warn(
+        {
+          err,
+          action: input.action,
+          entityId: input.entityId,
+          mode: resolveIssueLifecycleEnforcementModeForCompany(input.companyId),
+        },
+        "failed to persist issue lifecycle instrumentation",
+      );
+    }
+  }
 
   async function queueTaskWatchdogEvaluation(issue: { id: string; companyId: string }, runId?: string | null) {
     await taskWatchdogsSvc
@@ -3160,7 +3194,7 @@ export function issueRoutes(
     );
   }
 
-  async function assertAgentInReviewReviewPath(input: {
+  async function assertInReviewReviewPath(input: {
     existing: {
       id: string;
       companyId: string;
@@ -3170,12 +3204,12 @@ export function issueRoutes(
       monitorNextCheckAt?: Date | null;
     };
     updateFields: Record<string, unknown>;
-    actorType: string;
+    actor: ReturnType<typeof getActorInfo>;
   }) {
     const nextStatus = typeof input.updateFields.status === "string"
       ? input.updateFields.status
       : input.existing.status;
-    if (input.actorType !== "agent" || input.existing.status === "in_review" || nextStatus !== "in_review") return;
+    if (input.existing.status === "in_review" || nextStatus !== "in_review") return;
 
     const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
       ? input.existing.assigneeUserId
@@ -3185,7 +3219,10 @@ export function issueRoutes(
     const nextExecutionState = input.updateFields.executionState === undefined
       ? input.existing.executionState
       : input.updateFields.executionState;
-    if (hasExecutionParticipant(nextExecutionState)) return;
+    if (executionParticipantProvidesDeliveredReviewPath({
+      previousValue: input.existing.executionState,
+      nextValue: nextExecutionState,
+    })) return;
 
     const nextExecutionPolicy = input.updateFields.executionPolicy;
     if (hasScheduledMonitor({
@@ -3200,7 +3237,32 @@ export function issueRoutes(
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
 
-    throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
+    const lifecycleMode = resolveIssueLifecycleEnforcementModeForCompany(input.existing.companyId);
+    if (input.actor.actorType !== "agent" && lifecycleMode === "off") return;
+    if (input.actor.actorType !== "agent" && lifecycleMode === "shadow") {
+      await logIssueLifecycleActivity({
+        companyId: input.existing.companyId,
+        actorType: "system",
+        actorId: "issue_lifecycle_enforcement",
+        agentId: null,
+        runId: input.actor.runId,
+        action: "issue.lifecycle_shadow_finding",
+        entityType: "issue",
+        entityId: input.existing.id,
+        details: {
+          contractId: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.id,
+          contractVersion: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.version,
+          mode: lifecycleMode,
+          violation: "in_review_without_action_path",
+          disposition: "mutation_observed",
+          requestedByActorType: input.actor.actorType,
+          requestedByActorId: input.actor.actorId,
+        },
+      });
+      return;
+    }
+
+    throw unprocessable(INVALID_IN_REVIEW_DISPOSITION_MESSAGE, {
       code: "invalid_issue_disposition",
       missing: "review_path",
       validReviewPaths: [
@@ -3210,6 +3272,155 @@ export function issueRoutes(
         "typed_execution_state_current_participant",
         "scheduled_issue_monitor",
       ],
+    });
+  }
+
+  async function assertInProgressExecutionPath(input: {
+    existing: {
+      id: string;
+      companyId: string;
+      status: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+      monitorNextCheckAt?: Date | null;
+    };
+    updateFields: Record<string, unknown>;
+    actor: ReturnType<typeof getActorInfo>;
+  }) {
+    const nextStatus = typeof input.updateFields.status === "string"
+      ? input.updateFields.status
+      : input.existing.status;
+    if (input.existing.status === "in_progress" || nextStatus !== "in_progress") return;
+
+    const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
+      ? input.existing.assigneeUserId
+      : input.updateFields.assigneeUserId;
+    if (typeof nextAssigneeUserId === "string" && nextAssigneeUserId.trim().length > 0) return;
+    const nextAssigneeAgentId = input.updateFields.assigneeAgentId === undefined
+      ? input.existing.assigneeAgentId
+      : input.updateFields.assigneeAgentId;
+    if (
+      typeof nextAssigneeAgentId === "string" &&
+      nextAssigneeAgentId.trim().length > 0 &&
+      nextAssigneeAgentId !== input.existing.assigneeAgentId
+    ) return;
+    if (
+      typeof nextAssigneeAgentId === "string" &&
+      nextAssigneeAgentId.trim().length > 0 &&
+      await heartbeat.getIssueExecutionPath(
+        input.existing.companyId,
+        input.existing.id,
+        nextAssigneeAgentId,
+      )
+    ) return;
+    if (hasScheduledMonitor({
+      existingMonitorNextCheckAt: input.existing.monitorNextCheckAt ?? null,
+      patchMonitorNextCheckAt: input.updateFields.monitorNextCheckAt,
+      executionPolicy: input.updateFields.executionPolicy,
+    })) return;
+    if (await recoveryActionsSvc.getActiveForIssue(input.existing.companyId, input.existing.id)) return;
+    const lifecycleMode = resolveIssueLifecycleEnforcementModeForCompany(input.existing.companyId);
+    if (lifecycleMode === "off") return;
+
+    const details = {
+      contractId: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.id,
+      contractVersion: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.version,
+      mode: lifecycleMode,
+      violation: "in_progress_without_execution_path",
+      disposition: lifecycleMode === "enforce" ? "mutation_rejected" : "mutation_observed",
+      requestedByActorType: input.actor.actorType,
+      requestedByActorId: input.actor.actorId,
+    };
+    if (lifecycleMode === "shadow") {
+      await logIssueLifecycleActivity({
+        companyId: input.existing.companyId,
+        actorType: "system",
+        actorId: "issue_lifecycle_enforcement",
+        agentId: null,
+        runId: input.actor.runId,
+        action: "issue.lifecycle_shadow_finding",
+        entityType: "issue",
+        entityId: input.existing.id,
+        details,
+      });
+      return;
+    }
+
+    throw unprocessable(
+      "invalid_issue_disposition: Moving an agent-owned issue to in_progress requires an active run, queued wake, scheduled retry, monitor, explicit recovery action, or a newly assigned agent whose wake will be queued.",
+      {
+        code: "invalid_issue_disposition",
+        missing: "execution_path",
+        validExecutionPaths: [
+          "active_run",
+          "queued_wake",
+          "scheduled_retry",
+          "scheduled_issue_monitor",
+          "explicit_recovery_action",
+          "new_agent_assignment_wake",
+          "human_owner",
+        ],
+      },
+    );
+  }
+
+  function evaluateCreateLifecycleViolation(input: {
+    status: unknown;
+    assigneeUserId: unknown;
+    executionPolicy: unknown;
+  }): "in_progress_without_execution_path" | "in_review_without_action_path" | null {
+    if (input.status !== "in_progress" && input.status !== "in_review") return null;
+    if (typeof input.assigneeUserId === "string" && input.assigneeUserId.trim().length > 0) return null;
+    if (hasScheduledMonitor({ executionPolicy: input.executionPolicy })) return null;
+    return input.status === "in_progress"
+      ? "in_progress_without_execution_path"
+      : "in_review_without_action_path";
+  }
+
+  function assertCreateLifecycleDispositionAllowed(
+    companyId: string,
+    violation: ReturnType<typeof evaluateCreateLifecycleViolation>,
+  ) {
+    if (
+      !violation ||
+      resolveIssueLifecycleEnforcementModeForCompany(companyId) !== "enforce"
+    ) return;
+    throw unprocessable(
+      violation === "in_progress_without_execution_path"
+        ? "invalid_issue_disposition: Creating an in_progress issue requires a human owner or scheduled monitor; create agent work as todo and use the checkout/wake path."
+        : "invalid_issue_disposition: Creating an in_review issue requires a human owner or scheduled monitor.",
+      {
+        code: "invalid_issue_disposition",
+        missing: violation === "in_progress_without_execution_path" ? "execution_path" : "review_path",
+      },
+    );
+  }
+
+  async function logCreateLifecycleShadowFinding(input: {
+    issue: { id: string; companyId: string };
+    actor: ReturnType<typeof getActorInfo>;
+    violation: ReturnType<typeof evaluateCreateLifecycleViolation>;
+  }) {
+    const lifecycleMode = resolveIssueLifecycleEnforcementModeForCompany(input.issue.companyId);
+    if (!input.violation || lifecycleMode !== "shadow") return;
+    await logIssueLifecycleActivity({
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "issue_lifecycle_enforcement",
+      agentId: null,
+      runId: input.actor.runId,
+      action: "issue.lifecycle_shadow_finding",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        contractId: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.id,
+        contractVersion: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.version,
+        mode: lifecycleMode,
+        violation: input.violation,
+        disposition: "create_observed",
+        requestedByActorType: input.actor.actorType,
+        requestedByActorId: input.actor.actorId,
+      },
     });
   }
 
@@ -3490,6 +3701,9 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
     },
+    options?: {
+      activeRecoveryAction?: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>> | null;
+    },
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -3519,6 +3733,15 @@ export function issueRoutes(
         return false;
       }
       return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+    }
+    const activeRecoveryAction = options?.activeRecoveryAction;
+    if (
+      activeRecoveryAction?.status === "active" &&
+      activeRecoveryAction.companyId === issue.companyId &&
+      activeRecoveryAction.sourceIssueId === issue.id &&
+      activeRecoveryAction.ownerAgentId === actorAgentId
+    ) {
+      return true;
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
@@ -5455,8 +5678,8 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
+    if (!(await assertAgentIssueMutationAllowed(req, res, existing, { activeRecoveryAction }))) return;
     if (
       !(await assertRecoveryActionAuthority(
         req,
@@ -5476,10 +5699,15 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
-    await assertAgentInReviewReviewPath({
+    await assertInReviewReviewPath({
       existing,
       updateFields,
-      actorType: req.actor.type,
+      actor,
+    });
+    await assertInProgressExecutionPath({
+      existing,
+      updateFields,
+      actor,
     });
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
@@ -5511,6 +5739,7 @@ export function issueRoutes(
             status: sourceIssueStatus,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            lifecycleTransitionContext: { activeRecoveryResolution: true },
           },
           tx,
         );
@@ -6901,6 +7130,12 @@ export function issueRoutes(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
     );
+    const createLifecycleViolation = evaluateCreateLifecycleViolation({
+      status: createBody.status,
+      assigneeUserId: createBody.assigneeUserId,
+      executionPolicy,
+    });
+    assertCreateLifecycleDispositionAllowed(companyId, createLifecycleViolation);
     await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
@@ -6922,6 +7157,7 @@ export function issueRoutes(
       trustExplicitResponsibleUserId: actor.actorType === "user",
       watchdogActorRunId: actor.runId,
     });
+    await logCreateLifecycleShadowFinding({ issue, actor, violation: createLifecycleViolation });
     await issueReferencesSvc.syncIssue(issue.id);
     await externalObjectsSvc.syncIssueSafely(issue.id);
     const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
@@ -7067,6 +7303,12 @@ export function issueRoutes(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
     );
+    const createLifecycleViolation = evaluateCreateLifecycleViolation({
+      status: currentSerializedChild ? "blocked" : createBody.status,
+      assigneeUserId: createBody.assigneeUserId,
+      executionPolicy,
+    });
+    assertCreateLifecycleDispositionAllowed(parent.companyId, createLifecycleViolation);
     await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
@@ -7096,6 +7338,7 @@ export function issueRoutes(
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
       watchdogActorRunId: actor.runId,
     });
+    await logCreateLifecycleShadowFinding({ issue, actor, violation: createLifecycleViolation });
     await externalObjectsSvc.syncIssueSafely(issue.id);
 
     await logActivity(db, {
@@ -7450,7 +7693,10 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    const actorActiveRecoveryAction = req.actor.type === "agent"
+      ? await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
+      : null;
+    if (!(await assertAgentIssueMutationAllowed(req, res, existing, { activeRecoveryAction: actorActiveRecoveryAction }))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -7504,7 +7750,7 @@ export function issueRoutes(
       req.body.executionPolicy !== undefined ||
       explicitMoveToTodoRequested;
     const activeRecoveryActionBeforeUpdate = recoveryRelevantSourceMutationRequested
-      ? await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
+      ? actorActiveRecoveryAction ?? await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
       : null;
     if (
       recoveryRelevantSourceMutationRequested &&
@@ -7708,10 +7954,28 @@ export function issueRoutes(
       }
     }
 
-    await assertAgentInReviewReviewPath({
+    if (
+      resolveIssueLifecycleEnforcementModeForCompany(existing.companyId) === "enforce" &&
+      (existing.status === "done" || existing.status === "cancelled") &&
+      updateFields.status === "todo" &&
+      resumeRequested !== true &&
+      reopenRequested !== true
+    ) {
+      throw unprocessable("invalid_issue_transition: Terminal issues require explicit resume or reopen intent", {
+        code: "invalid_issue_transition",
+        guard: "explicit_resume",
+      });
+    }
+
+    await assertInReviewReviewPath({
       existing,
       updateFields,
-      actorType: req.actor.type,
+      actor,
+    });
+    await assertInProgressExecutionPath({
+      existing,
+      updateFields,
+      actor,
     });
 
     const nextAssigneeAgentId =
@@ -8281,21 +8545,140 @@ export function issueRoutes(
       requestedByActorType: actor.actorType,
       requestedByActorId: actor.actorId,
     });
+    const requiresConfirmedAssignmentHandoff =
+      resolveIssueLifecycleEnforcementModeForCompany(issue.companyId) === "enforce" &&
+      assigneeChanged &&
+      Boolean(issue.assigneeAgentId) &&
+      !isClosedIssueStatus(issue.status) &&
+      issue.status !== "backlog";
+
+    const compensateAssignmentHandoffFailure = async () => {
+      const retainedAgentId = existing.assigneeAgentId ?? (existing.assigneeUserId ? null : issue.assigneeAgentId);
+      const retainedUserId = existing.assigneeAgentId ? null : existing.assigneeUserId;
+      const recoveryOwnerAgentId = issue.assigneeAgentId ?? retainedAgentId;
+      let compensated: Awaited<ReturnType<typeof svc.update>>;
+      let recoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
+      try {
+        ({ compensated, recoveryAction } = await db.transaction(async (tx) => {
+          const compensatedIssue = await svc.update(
+            issue.id,
+            {
+              status: "blocked",
+              assigneeAgentId: retainedAgentId,
+              assigneeUserId: retainedUserId,
+            },
+            tx,
+          );
+          if (!compensatedIssue) throw notFound("Issue not found during handoff compensation");
+          const action = await recoveryActionsSvc.upsertSourceScoped({
+            companyId: issue.companyId,
+            sourceIssueId: issue.id,
+            kind: "missing_disposition",
+            ownerType: recoveryOwnerAgentId ? "agent" : "board",
+            ownerAgentId: recoveryOwnerAgentId,
+            ownerUserId: recoveryOwnerAgentId ? null : retainedUserId,
+            previousOwnerAgentId: existing.assigneeAgentId,
+            returnOwnerAgentId: issue.assigneeAgentId,
+            cause: "handoff_wake_delivery_failed",
+            fingerprint: `handoff-wake-delivery-failed:${issue.id}:${issue.updatedAt.toISOString()}`,
+            evidence: {
+              source: "issue.update",
+              requestedAssigneeAgentId: issue.assigneeAgentId,
+              retainedAssigneeAgentId: retainedAgentId,
+              retainedAssigneeUserId: retainedUserId,
+            },
+            nextAction: "Restore a confirmed execution wake before resolving the failed handoff.",
+            wakePolicy: { type: "manual_after_delivery_failure" },
+            maxAttempts: 1,
+          }, tx);
+          return { compensated: compensatedIssue, recoveryAction: action };
+        }));
+      } catch (compensationError) {
+        // The transaction rolls back both the blocked state and recovery row.
+        // Restore the pre-handoff owner/state as a second safe disposition so
+        // a recovery-store outage cannot leave an ownerless or pathless half-state.
+        try {
+          const rolledBack = await svc.update(issue.id, {
+            status: existing.status,
+            assigneeAgentId: existing.assigneeAgentId,
+            assigneeUserId: existing.assigneeUserId,
+            executionState: existing.executionState,
+            lifecycleTransitionContext: {
+              handoffRollback: {
+                committedStatus: issue.status,
+                previousStatus: existing.status,
+              },
+            },
+          });
+          if (!rolledBack) throw notFound("Issue not found during handoff rollback");
+          issueResponse = rolledBack;
+        } catch (rollbackError) {
+          logger.error(
+            { compensationError, rollbackError, issueId: issue.id },
+            "failed to atomically compensate or roll back assignment handoff",
+          );
+          throw new HttpError(503, "Issue handoff and rollback could not be persisted", {
+            code: "issue_handoff_compensation_failed",
+            lifecycleState: "handoff_failed",
+            issueId: issue.id,
+          });
+        }
+        throw new HttpError(503, "Issue handoff was rolled back because recovery state could not be persisted", {
+          code: "issue_handoff_rolled_back",
+          issueId: issue.id,
+        });
+      }
+      await logIssueLifecycleActivity({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "issue_lifecycle_enforcement",
+        agentId: recoveryOwnerAgentId,
+        runId: actor.runId,
+        action: "issue.handoff_failed",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          contractId: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.id,
+          contractVersion: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.version,
+          lifecycleState: "handoff_failed",
+          recoveryActionId: recoveryAction.id,
+          previousOwnerRetained: true,
+          retainedAssigneeAgentId: retainedAgentId,
+          retainedAssigneeUserId: retainedUserId,
+        },
+      });
+      if (compensated) issueResponse = compensated;
+      throw new HttpError(503, "Issue handoff failed; the source was blocked with a recovery action", {
+        code: "issue_handoff_failed",
+        lifecycleState: "handoff_failed",
+        issueId: issue.id,
+        recoveryActionId: recoveryAction.id,
+      });
+    };
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
-    void (async () => {
+    const dispatchUpdateWakeups = async () => {
       type WakeupRequest = NonNullable<Parameters<typeof heartbeat.wakeup>[1]>;
       type DependencyReadinessProvider = {
         getDependencyReadiness?: typeof svc.getDependencyReadiness;
       };
       const dependencyReadinessSvc = svc as DependencyReadinessProvider;
       const wakeups = new Map<string, { agentId: string; wakeup: WakeupRequest }>();
+      let assignmentHandoffConfirmed = false;
       const addWakeup = (agentId: string, wakeup: WakeupRequest) => {
         const wakeIssueId =
           wakeup.payload && typeof wakeup.payload === "object" && typeof wakeup.payload.issueId === "string"
             ? wakeup.payload.issueId
             : issue.id;
-        wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup });
+        const key = `${agentId}:${wakeIssueId}`;
+        const existingWakeup = wakeups.get(key)?.wakeup;
+        if (
+          existingWakeup?.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON &&
+          wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON
+        ) {
+          return;
+        }
+        wakeups.set(key, { agentId, wakeup });
       };
       const addDependencyResolvedWakeup = async (input: {
         agentId: string;
@@ -8516,41 +8899,76 @@ export function issueRoutes(
       if (becameTerminal && issue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
         if (parent) {
-          addWakeup(parent.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_children_completed",
-            payload: {
-              issueId: parent.id,
-              completedChildIssueId: issue.id,
-              childIssueIds: parent.childIssueIds,
-              childIssueSummaries: parent.childIssueSummaries,
-              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
-            },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: parent.id,
-              taskId: parent.id,
-              wakeReason: "issue_children_completed",
-              source: "issue.children_completed",
-              completedChildIssueId: issue.id,
-              childIssueIds: parent.childIssueIds,
-              childIssueSummaries: parent.childIssueSummaries,
-              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
-            },
-          });
+          const lifecycleMode = resolveIssueLifecycleEnforcementModeForCompany(issue.companyId);
+          if (lifecycleMode !== "off") {
+            await logIssueLifecycleActivity({
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "issue_lifecycle_enforcement",
+              agentId: null,
+              runId: actor.runId,
+              action: lifecycleMode === "enforce"
+                ? "issue.lifecycle_enforcement_applied"
+                : "issue.lifecycle_shadow_finding",
+              entityType: "issue",
+              entityId: parent.id,
+              details: {
+                contractId: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.id,
+                contractVersion: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.version,
+                mode: lifecycleMode,
+                violation: "parent_child_is_structure_not_dependency",
+                completedChildIssueId: issue.id,
+                legacyWakeReason: "issue_children_completed",
+                disposition: lifecycleMode === "enforce" ? "wake_suppressed" : "wake_observed",
+              },
+            });
+          }
+          if (shouldEmitStructuralParentWake(lifecycleMode)) {
+            addWakeup(parent.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_children_completed",
+              payload: {
+                issueId: parent.id,
+                completedChildIssueId: issue.id,
+                childIssueIds: parent.childIssueIds,
+                childIssueSummaries: parent.childIssueSummaries,
+                childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+              },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: parent.id,
+                taskId: parent.id,
+                wakeReason: "issue_children_completed",
+                source: "issue.children_completed",
+                completedChildIssueId: issue.id,
+                childIssueIds: parent.childIssueIds,
+                childIssueSummaries: parent.childIssueSummaries,
+                childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+              },
+            });
+          }
         }
       }
 
       for (const { agentId, wakeup } of wakeups.values()) {
-        heartbeat
-          .wakeup(agentId, wakeup)
-          .then((wakeRun) => {
-            if (wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) return;
+        try {
+          const wakeRun = await heartbeat.wakeup(agentId, wakeup);
+          if (
+            requiresConfirmedAssignmentHandoff &&
+            agentId === issue.assigneeAgentId &&
+            !wakeRun
+          ) {
+            await compensateAssignmentHandoffFailure();
+          }
+          if (requiresConfirmedAssignmentHandoff && agentId === issue.assigneeAgentId && wakeRun) {
+            assignmentHandoffConfirmed = true;
+          }
+          if (wakeup.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) {
             const payload = wakeup.payload && typeof wakeup.payload === "object" ? wakeup.payload : {};
             const dependentIssueId = typeof payload.issueId === "string" ? payload.issueId : issue.id;
-            return logActivity(db, {
+            await logActivity(db, {
               companyId: issue.companyId,
               actorType: "system",
               actorId: "issue_update",
@@ -8569,10 +8987,29 @@ export function issueRoutes(
                 blockerIssueIds: Array.isArray(payload.blockerIssueIds) ? payload.blockerIssueIds : [],
               },
             });
-          })
-          .catch((err) => logger.warn({ err, issueId: issue.id, agentId }, "failed to wake agent on issue update"));
+          }
+        } catch (err) {
+          if (
+            requiresConfirmedAssignmentHandoff &&
+            agentId === issue.assigneeAgentId &&
+            !(err instanceof HttpError && err.details && typeof err.details === "object" &&
+              (err.details as Record<string, unknown>).code === "issue_handoff_failed")
+          ) {
+            await compensateAssignmentHandoffFailure();
+          }
+          if (err instanceof HttpError) throw err;
+          logger.warn({ err, issueId: issue.id, agentId }, "failed to wake agent on issue update");
+        }
       }
-    })();
+      if (requiresConfirmedAssignmentHandoff && !assignmentHandoffConfirmed) {
+        await compensateAssignmentHandoffFailure();
+      }
+    };
+    if (requiresConfirmedAssignmentHandoff) {
+      await dispatchUpdateWakeups();
+    } else {
+      void dispatchUpdateWakeups();
+    }
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
     res.json({ ...issueResponse, comment });
@@ -9852,7 +10289,20 @@ export function issueRoutes(
             ? wakeup.payload.issueId
             : currentIssue.id;
         const key = `${agentId}:${wakeIssueId}`;
-        if (wakeups.has(key)) return;
+        const existingWakeup = wakeups.get(key)?.wakeup;
+        if (
+          existingWakeup?.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON &&
+          wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON
+        ) {
+          return;
+        }
+        if (
+          existingWakeup &&
+          existingWakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON &&
+          wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON
+        ) {
+          return;
+        }
         wakeups.set(key, { agentId, wakeup });
       };
       const addDependencyResolvedWakeup = async (input: {
@@ -10017,30 +10467,56 @@ export function issueRoutes(
       if (becameTerminal && currentIssue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(currentIssue.parentId);
         if (parent) {
-          addWakeup(parent.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_children_completed",
-            payload: {
-              issueId: parent.id,
-              completedChildIssueId: currentIssue.id,
-              childIssueIds: parent.childIssueIds,
-              childIssueSummaries: parent.childIssueSummaries,
-              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
-            },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: parent.id,
-              taskId: parent.id,
-              wakeReason: "issue_children_completed",
-              source: "issue.children_completed",
-              completedChildIssueId: currentIssue.id,
-              childIssueIds: parent.childIssueIds,
-              childIssueSummaries: parent.childIssueSummaries,
-              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
-            },
-          });
+          const lifecycleMode = resolveIssueLifecycleEnforcementModeForCompany(currentIssue.companyId);
+          if (lifecycleMode !== "off") {
+            await logIssueLifecycleActivity({
+              companyId: currentIssue.companyId,
+              actorType: "system",
+              actorId: "issue_lifecycle_enforcement",
+              agentId: null,
+              runId: actor.runId,
+              action: lifecycleMode === "enforce"
+                ? "issue.lifecycle_enforcement_applied"
+                : "issue.lifecycle_shadow_finding",
+              entityType: "issue",
+              entityId: parent.id,
+              details: {
+                contractId: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.id,
+                contractVersion: ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1.version,
+                mode: lifecycleMode,
+                violation: "parent_child_is_structure_not_dependency",
+                completedChildIssueId: currentIssue.id,
+                legacyWakeReason: "issue_children_completed",
+                disposition: lifecycleMode === "enforce" ? "wake_suppressed" : "wake_observed",
+              },
+            });
+          }
+          if (shouldEmitStructuralParentWake(lifecycleMode)) {
+            addWakeup(parent.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_children_completed",
+              payload: {
+                issueId: parent.id,
+                completedChildIssueId: currentIssue.id,
+                childIssueIds: parent.childIssueIds,
+                childIssueSummaries: parent.childIssueSummaries,
+                childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+              },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: parent.id,
+                taskId: parent.id,
+                wakeReason: "issue_children_completed",
+                source: "issue.children_completed",
+                completedChildIssueId: currentIssue.id,
+                childIssueIds: parent.childIssueIds,
+                childIssueSummaries: parent.childIssueSummaries,
+                childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+              },
+            });
+          }
         }
       }
 

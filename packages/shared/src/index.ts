@@ -2108,3 +2108,11 @@ export {
   type CreateEnvironmentCustomImageTerminalSessionToken,
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
+
+export {
+  ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1,
+  isIssueLifecycleContractTransitionAllowed,
+  type IssueLifecycleExecutionContractV1,
+  type IssueLifecycleContractState,
+  type IssueLifecycleContractField,
+} from "./issue-lifecycle-contract.js";

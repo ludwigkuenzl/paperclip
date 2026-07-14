@@ -1,9 +1,12 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockFindExistingIssueBlockersResolvedWake = vi.hoisted(() => vi.fn(async () => null));
+const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const originalLifecycleEnforcementMode = process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT;
+const originalLifecycleEnforcementCompanies = process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS;
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -47,6 +50,7 @@ vi.mock("../services/index.js", () => ({
   heartbeatService: () => ({
     wakeup: mockWakeup,
     reportRunActivity: vi.fn(async () => undefined),
+    getActiveRunForAgent: vi.fn(async () => null),
   }),
   getIssueContinuationSummaryDocument: vi.fn(async () => null),
   instanceSettingsService: () => ({
@@ -77,7 +81,7 @@ vi.mock("../services/index.js", () => ({
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   }),
   issueService: () => mockIssueService,
-  logActivity: vi.fn(async () => undefined),
+  logActivity: mockLogActivity,
   projectService: () => ({
     getById: vi.fn(),
     listByIds: vi.fn(async () => []),
@@ -124,6 +128,8 @@ async function createApp() {
 
 describe("issue dependency wakeups in issue routes", () => {
   beforeEach(() => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "shadow";
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS = "company-1";
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
@@ -149,6 +155,19 @@ describe("issue dependency wakeups in issue routes", () => {
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    if (originalLifecycleEnforcementMode === undefined) {
+      delete process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT;
+    } else {
+      process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = originalLifecycleEnforcementMode;
+    }
+    if (originalLifecycleEnforcementCompanies === undefined) {
+      delete process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS;
+    } else {
+      process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS = originalLifecycleEnforcementCompanies;
+    }
   });
 
   it("wakes dependents when the final blocker transitions to done", async () => {
@@ -368,5 +387,102 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       );
     });
+  });
+
+  it("gives an explicit dependency wake priority over a structural parent wake", async () => {
+    const childIssue = {
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-102",
+      title: "Final explicit blocker",
+      description: null,
+      status: "in_progress",
+      priority: "medium",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue(childIssue);
+    mockIssueService.update.mockResolvedValue({ ...childIssue, status: "done" });
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+      {
+        id: "parent-1",
+        assigneeAgentId: "agent-9",
+        blockerIssueIds: ["child-1"],
+      },
+    ]);
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: "parent-1",
+      assigneeAgentId: "agent-9",
+      childIssueIds: ["child-1"],
+      childIssueSummaries: [],
+      childIssueSummaryTruncated: false,
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockWakeup).toHaveBeenCalledTimes(1));
+    expect(mockWakeup).toHaveBeenCalledWith(
+      "agent-9",
+      expect.objectContaining({
+        reason: "issue_blockers_resolved",
+        payload: expect.objectContaining({
+          issueId: "parent-1",
+          resolvedBlockerIssueId: "child-1",
+        }),
+      }),
+    );
+  });
+
+  it("suppresses structural parent wakes for cancelled children in enforce mode", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const childIssue = {
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-103",
+      title: "Structural child only",
+      description: null,
+      status: "in_progress",
+      priority: "medium",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue(childIssue);
+    mockIssueService.update.mockResolvedValue({ ...childIssue, status: "cancelled" });
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: "parent-1",
+      assigneeAgentId: "agent-9",
+      childIssueIds: ["child-1"],
+      childIssueSummaries: [],
+      childIssueSummaryTruncated: false,
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "cancelled" });
+
+    expect(res.status).toBe(200);
+    expect(mockWakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.lifecycle_enforcement_applied",
+        entityId: "parent-1",
+        details: expect.objectContaining({
+          violation: "parent_child_is_structure_not_dependency",
+          disposition: "wake_suppressed",
+        }),
+      }),
+    );
   });
 });

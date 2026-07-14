@@ -2828,10 +2828,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const failedHandoff = recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON;
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
-      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      // A failed handoff does not transfer source accountability. The recovery
+      // action has its own owner and wake path, while the issue remains assigned
+      // to the owner whose result still needs a valid disposition.
+      assigneeAgentId: failedHandoff
+        ? input.issue.assigneeAgentId
+        : recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
     });
     if (!updated) return null;
 
@@ -2939,6 +2945,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryOwnerAgentId: recoveryAction.ownerAgentId,
         previousOwnerAgentId: recoveryAction.previousOwnerAgentId,
         returnOwnerAgentId: recoveryAction.returnOwnerAgentId,
+        lifecycleState: failedHandoff ? "handoff_failed" : null,
+        previousOwnerRetained: failedHandoff,
         blockerIssueIds: blockerIds,
       },
     });

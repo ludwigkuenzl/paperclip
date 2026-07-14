@@ -2777,6 +2777,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(sourceIssue?.status).toBe("blocked");
+    expect(sourceIssue?.assigneeAgentId).toBe(agentId);
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -2810,7 +2811,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(JSON.stringify(comments[0]?.metadata ?? {})).not.toContain("sk-test-successful-handoff-secret");
 
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
-    expect(activity.some((event) => event.action === "issue.successful_run_handoff_escalated")).toBe(true);
+    expect(activity.find((event) => event.action === "issue.successful_run_handoff_escalated")?.details).toMatchObject({
+      lifecycleState: "handoff_failed",
+      previousOwnerRetained: true,
+    });
   });
 
   it("escalates an exhausted successful handoff run that still leaves no disposition", async () => {

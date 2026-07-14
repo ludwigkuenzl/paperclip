@@ -1,12 +1,13 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
+  create: vi.fn(),
   createChild: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
@@ -21,6 +22,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   reportRunActivity: vi.fn(async () => undefined),
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
+  getIssueExecutionPath: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
 }));
 
@@ -42,6 +44,7 @@ const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWher
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
+  transaction: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
@@ -52,6 +55,13 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
 }));
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  getActiveForIssue: vi.fn(async () => null),
+  listActiveForIssues: vi.fn(async () => new Map()),
+  upsertSourceScoped: vi.fn(async () => ({ id: "recovery-action-1" })),
+}));
+const originalLifecycleEnforcementMode = process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT;
+const originalLifecycleEnforcementCompanies = process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS;
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
@@ -114,10 +124,7 @@ function registerModuleMocks() {
       syncDocument: async () => undefined,
       syncIssue: async () => undefined,
     }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
+    issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
@@ -168,6 +175,8 @@ async function createApp(actor?: TestActor) {
 
 describe("issue execution policy routes", () => {
   beforeEach(() => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "shadow";
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS = "company-1";
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/issues.js");
@@ -182,7 +191,13 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
+    mockIssueRecoveryActionService.upsertSourceScoped.mockResolvedValue({ id: "recovery-action-1" });
+    mockHeartbeatService.wakeup.mockResolvedValue({ id: "queued-run-1" });
+    mockHeartbeatService.getIssueExecutionPath.mockResolvedValue(null);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
+    mockDb.transaction.mockImplementation(async (callback: (tx: typeof mockDb) => unknown) => callback(mockDb));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelectWhere.mockImplementation(() => ({
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -222,6 +237,19 @@ describe("issue execution policy routes", () => {
       };
     });
     mockAccessService.hasPermission.mockResolvedValue(false);
+  });
+
+  afterEach(() => {
+    if (originalLifecycleEnforcementMode === undefined) {
+      delete process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT;
+    } else {
+      process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = originalLifecycleEnforcementMode;
+    }
+    if (originalLifecycleEnforcementCompanies === undefined) {
+      delete process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS;
+    } else {
+      process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS = originalLifecycleEnforcementCompanies;
+    }
   });
 
   it("rejects an agent-authored in_review transition without a review path", async () => {
@@ -404,7 +432,7 @@ describe("issue execution policy routes", () => {
     );
   });
 
-  it("allows board-authored in_review repair updates without a review path", async () => {
+  it("observes board-authored in_review transitions without a review path in shadow mode", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -429,8 +457,442 @@ describe("issue execution policy routes", () => {
       .send({ status: "in_review" });
 
     expect(res.status).toBe(200);
-    expect(mockIssueThreadInteractionService.listForIssue).not.toHaveBeenCalled();
-    expect(mockIssueApprovalService.listApprovalsForIssue).not.toHaveBeenCalled();
+    expect(mockIssueThreadInteractionService.listForIssue).toHaveBeenCalledWith(issue.id);
+    expect(mockIssueApprovalService.listApprovalsForIssue).toHaveBeenCalledWith(issue.id);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.lifecycle_shadow_finding",
+        entityId: issue.id,
+        details: expect.objectContaining({
+          contractId: "paperclip.issue-lifecycle-execution",
+          contractVersion: "1.0.0",
+          violation: "in_review_without_action_path",
+          disposition: "mutation_observed",
+        }),
+      }),
+    );
+  });
+
+  it("keeps shadow mode fail-open when lifecycle instrumentation cannot be persisted", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1013",
+      title: "Shadow telemetry outage",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockLogActivity.mockRejectedValueOnce(new Error("activity store unavailable"));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({ status: "in_review" }),
+    );
+  });
+
+  it("rejects board-authored in_review transitions without a review path in enforce mode", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1008",
+      title: "Board repair without owner",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "review_path",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale typed agent participant that will not receive a reviewer wake", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1012",
+      title: "Stale participant metadata",
+      executionPolicy: null,
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: {
+          type: "agent",
+          agentId: "44444444-4444-4444-8444-444444444444",
+        },
+        returnAssignee: {
+          type: "agent",
+          agentId: "33333333-3333-4333-8333-333333333333",
+        },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({ missing: "review_path" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("observes board-authored in_progress transitions without an execution path in shadow mode", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1009",
+      title: "Board active work without wake",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress" });
+
+    expect(res.status).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.lifecycle_shadow_finding",
+        details: expect.objectContaining({
+          violation: "in_progress_without_execution_path",
+          disposition: "mutation_observed",
+        }),
+      }),
+    );
+  });
+
+  it("rejects board-authored in_progress transitions without an execution path in enforce mode", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1010",
+      title: "Board active work blocked by enforcement",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "execution_path",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent in_progress transition when its supplied run id has no live issue path", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1013",
+      title: "Stale actor run",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: issue.assigneeAgentId,
+      companyId: issue.companyId,
+      runId: "stale-or-unrelated-run",
+    }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress" });
+
+    expect(res.status).toBe(422);
+    expect(mockHeartbeatService.getIssueExecutionPath).toHaveBeenCalledWith(
+      issue.companyId,
+      issue.id,
+      issue.assigneeAgentId,
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["queued wake", { kind: "wake", id: "wake-1", agentId: "33333333-3333-4333-8333-333333333333", status: "queued" }],
+    ["scheduled retry", { kind: "run", id: "retry-1", agentId: "33333333-3333-4333-8333-333333333333", status: "scheduled_retry" }],
+  ])("allows an in_progress transition with an existing %s", async (_label, executionPath) => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1014",
+      title: "Durable execution path",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockHeartbeatService.getIssueExecutionPath.mockResolvedValue(executionPath);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows a human-owned in_progress transition in enforce mode", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      createdByUserId: "local-board",
+      identifier: "PAP-1011",
+      title: "Human active work",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress" });
+
+    expect(res.status).toBe(200);
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.lifecycle_shadow_finding" }),
+    );
+  });
+
+  it("rejects a terminal-to-todo transition without explicit resume intent in enforce mode", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "done",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      createdByUserId: "local-board",
+      identifier: "PAP-1015",
+      title: "Closed work",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_transition",
+      guard: "explicit_resume",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("compensates a failed enforced assignment handoff and retains the previous owner", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const previousOwnerAgentId = "33333333-3333-4333-8333-333333333333";
+    const nextOwnerAgentId = "44444444-4444-4444-8444-444444444444";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: previousOwnerAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1016",
+      title: "Atomic assignment handoff",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+      updatedAt: new Date("2026-07-14T00:00:00.000Z"),
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update
+      .mockImplementationOnce(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date("2026-07-14T00:01:00.000Z"),
+      }))
+      .mockImplementationOnce(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date("2026-07-14T00:02:00.000Z"),
+      }));
+    mockHeartbeatService.wakeup.mockRejectedValueOnce(new Error("queue unavailable"));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress", assigneeAgentId: nextOwnerAgentId });
+
+    expect(res.status).toBe(503);
+    expect(res.body.details).toMatchObject({
+      code: "issue_handoff_failed",
+      lifecycleState: "handoff_failed",
+      recoveryActionId: "recovery-action-1",
+    });
+    expect(mockIssueService.update).toHaveBeenLastCalledWith(
+      issue.id,
+      expect.objectContaining({
+        status: "blocked",
+        assigneeAgentId: previousOwnerAgentId,
+        assigneeUserId: null,
+      }),
+      expect.anything(),
+    );
+    expect(mockIssueRecoveryActionService.upsertSourceScoped).toHaveBeenCalledWith(
+      expect.objectContaining({
+        companyId: issue.companyId,
+        sourceIssueId: issue.id,
+        cause: "handoff_wake_delivery_failed",
+        previousOwnerAgentId,
+        returnOwnerAgentId: nextOwnerAgentId,
+        maxAttempts: 1,
+      }),
+      expect.anything(),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.handoff_failed",
+        details: expect.objectContaining({ previousOwnerRetained: true }),
+      }),
+    );
+  });
+
+  it("rolls back the handoff when atomic recovery-action persistence fails", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    const previousOwnerAgentId = "33333333-3333-4333-8333-333333333333";
+    const nextOwnerAgentId = "44444444-4444-4444-8444-444444444444";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: previousOwnerAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1017",
+      title: "Rollback failed recovery persistence",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+      updatedAt: new Date("2026-07-14T00:00:00.000Z"),
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date("2026-07-14T00:01:00.000Z"),
+    }));
+    mockHeartbeatService.wakeup.mockRejectedValueOnce(new Error("queue unavailable"));
+    mockIssueRecoveryActionService.upsertSourceScoped.mockRejectedValueOnce(new Error("recovery store unavailable"));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress", assigneeAgentId: nextOwnerAgentId });
+
+    expect(res.status).toBe(503);
+    expect(res.body.details).toMatchObject({
+      code: "issue_handoff_rolled_back",
+      issueId: issue.id,
+    });
+    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.update).toHaveBeenLastCalledWith(issue.id, expect.objectContaining({
+      status: "todo",
+      assigneeAgentId: previousOwnerAgentId,
+      assigneeUserId: null,
+      executionState: null,
+      lifecycleTransitionContext: {
+        handoffRollback: {
+          committedStatus: "in_progress",
+          previousStatus: "todo",
+        },
+      },
+    }));
   });
 
   it("does not auto-start execution review when reviewers are added to an already in_review issue", async () => {
@@ -562,6 +1024,56 @@ describe("issue execution policy routes", () => {
         }),
       }),
     );
+  });
+
+  it("rejects creating an unowned in_progress issue in enforce mode", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Unowned active work",
+        status: "in_progress",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "execution_path",
+    });
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects creating an unowned in_review child in enforce mode", async () => {
+    process.env.PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT = "enforce";
+    mockIssueService.getById.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "in_progress",
+      assigneeAgentId: "11111111-1111-4111-8111-111111111111",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1001",
+      title: "Parent issue",
+      executionPolicy: null,
+      executionState: null,
+    });
+
+    const res = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/children")
+      .send({
+        title: "Unowned review",
+        status: "in_review",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "review_path",
+    });
+    expect(mockIssueService.createChild).not.toHaveBeenCalled();
   });
 
   it("rejects child monitor scheduling by a non-assignee agent even with task assignment permission", async () => {

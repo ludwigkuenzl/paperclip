@@ -1,12 +1,52 @@
 # Execution Semantics
 
 Status: Current implementation guide
-Date: 2026-06-10
+Date: 2026-07-14
 Audience: Product and engineering
 
 This document explains how Paperclip interprets issue assignment, issue status, execution runs, wakeups, parent/sub-issue structure, and blocker relationships.
 
 `doc/SPEC-implementation.md` remains the V1 contract. This document is the detailed execution model behind that contract.
+
+## Versioned M1 Lifecycle Contract
+
+The machine-readable M1 contract is exported as `ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1` from `packages/shared/src/issue-lifecycle-contract.ts`.
+
+Its contract id is `paperclip.issue-lifecycle-execution`, version `1.0.0`. The canonical logical fields are `current_owner`, `current_state`, `next_action`, `next_owner`, `active_run_id`, `blocking_resource`, `blocker_reason`, `last_progress_at`, `next_wake_at`, and `retry_count`. They are derived from the existing issue, run, wake, recovery-action, relation, and monitor records; M1 does not require a destructive storage migration.
+
+`done` and `cancelled` are terminal during normal execution. Their only M1 reopen transition is guarded `-> todo` with an explicit `resume` intent; an inert comment or ordinary update is not a reopen.
+
+Lifecycle enforcement is controlled by `PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT`:
+
+- `off`: preserve legacy mutation and structural-parent wake behavior
+- `shadow` (default): preserve behavior and write versioned lifecycle findings to activity
+- `enforce`: for explicitly allowlisted companies, reject unsupported lifecycle transitions and create dispositions, and suppress structural parent-completion wakes that are not backed by an explicit blocker relation
+
+`enforce` is a canary-only rollout step and also requires the company id in `PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS` (comma-separated). An empty allowlist fails closed to `shadow`, not instance-wide enforcement. The effective company mode is read for each scoped mutation, so configuration readback does not depend on route construction. Roll back immediately by setting the mode to `off`; the contract adds no irreversible storage state and legacy activity/action names remain readable.
+
+Before enabling `enforce`, run a shadow observation window and record the baseline from `issue.lifecycle_shadow_finding` activities plus company-scoped wake-request idempotency keys, grouped by contract version, violation, actor type, and disposition. The minimum rollout comparison is:
+
+- attempted `in_progress` transitions without an execution path
+- attempted `in_review` transitions without a review path
+- legacy `issue_children_completed` wakes that had no explicit blocker edge
+- duplicate dependency-wake attempts for the same company-scoped idempotency key
+- resulting stranded-work and issue-graph recovery findings
+
+Promote only a bounded canary after each observed case is classified as a true violation or a documented compatibility exception. Compare canary rates with the shadow baseline and roll back to `off` if enforcement increases stranded work, suppresses a required explicit dependency wake, or rejects a valid human-owned path.
+
+### M1 implementation audit (2026-07-14)
+
+| Mechanism | Baseline drift | M1 behavior |
+| --- | --- | --- |
+| `in_review` route validation | Agent transitions were checked, but board transitions could create review state without a path. A typed agent participant could later appear healthy even when no reviewer wake was delivered. | Board drift is measured in `shadow` and rejected in `enforce`; the liveness classifier requires a queued/active reviewer path for agent participants. |
+| `in_progress` route validation | A direct mutation could create agent-owned active state without a run, wake, monitor, or recovery action; an arbitrary actor run id was not sufficient proof of an issue path. | Missing execution paths are measured in `shadow` and rejected in `enforce`; live run, queued wake, and scheduled-retry records are company/issue/agent checked. Human-owned work and a new agent assignment that queues a wake remain valid. |
+| create disposition | Create and child-create could persist `in_progress` or `in_review` before a durable execution/review path existed. | In canary `enforce`, active/review creates require a human owner or scheduled monitor; agent work is created as `todo` and enters active state through checkout/wake. Shadow records the legacy create. |
+| transition graph | Target status validation accepted any known status, even when the M1 graph did not contain the edge. | The issue service consumes the versioned transition graph in canary `enforce`; terminal reopen additionally requires explicit `resume` or `reopen` intent. |
+| dependency delivery | Route preflight was advisory and concurrent callers could pass it together; coalescing could retain a lower-priority structural/comment wake. | Enqueue uses a company/key transaction lock and in-transaction re-read. `issue_blockers_resolved` wins same-agent/same-issue wake merging. |
+| parent/child terminal wake | `done` and `cancelled` children could both produce a structural `issue_children_completed` wake even without a blocker edge. | Shadow records compatibility wakes; enforce suppresses them. Only an explicit blocker reaching `done` owns dependency completion. |
+| exhausted successful-run handoff | Recovery blocked the source, but recovery ownership could overwrite the source assignee and obscure failed accountability. | Delivery is transactional-or-compensating: when the ordered handoff cannot be confirmed, logical state is `handoff_failed`; the source is blocked, retains its previous owner, and exposes a separately owned recovery action with one bounded wake path. |
+
+The rollout flag changes only mutation/wake enforcement. The transaction-level idempotency and previous-owner retention fixes are invariant repairs and remain active in every mode. No M1 path requires replaying old exports or rewriting existing issue rows.
 
 ## 1. Core Model
 
@@ -153,9 +193,10 @@ Use it for:
 - work breakdown
 - rollup context
 - explaining why a child issue exists
-- waking the parent assignee when all direct children become terminal
 
 Do not treat `parentId` as execution dependency by itself.
+
+Legacy and shadow mode may still emit `issue_children_completed` for compatibility and measure it as a lifecycle finding. Enforce mode suppresses that structural wake. If the parent must resume when a child completes, add an explicit blocker edge so the exact dependency wake path owns delivery.
 
 ### Blockers (`blockedByIssueIds`)
 
@@ -414,18 +455,24 @@ This is review/approval state: execution is paused because the next move belongs
 
 A healthy `in_review` issue has at least one valid action path:
 
-- a typed execution-policy participant who can approve or request changes
+- a typed agent execution-policy participant with a queued or active reviewer wake, or a typed user participant who can act directly
 - a pending issue-thread interaction or linked approval waiting for a named responder
 - a human owner via `assigneeUserId`
 - an active run or queued wake that is expected to process the review state
 - an active one-shot monitor for an external service or async review loop that the assignee owns
 - an open explicit recovery action for an ambiguous review handoff
 
-Agent-assigned `in_review` with no typed participant is only healthy when one of the other paths exists. Assignment to the same agent that produced the handoff is not, by itself, a review path.
+Agent-assigned `in_review` with no delivered participant path is only healthy when one of the other paths exists. Naming an agent participant without queueing or running its reviewer wake is not delivery. Assignment to the same agent that produced the handoff is not, by itself, a review path.
 
 An `in_review` issue is stalled when it has no typed participant, no pending interaction or approval, no user owner, no active monitor, no active run, no queued wake, and no explicit recovery action. Paperclip should surface that state as recovery work rather than silently completing the issue or leaving blocker chains parked indefinitely.
 
 When an execution-policy review stage has a pending agent participant, the participant's run is part of the review path only while it is live or queued. If that participant run reaches a terminal state while `executionState.status` remains `pending`, no decision has been recorded. Paperclip should queue one bounded normal-model recovery wake for the same participant when the agent is invokable and no other review path exists. If that recovery run also finishes while the stage remains pending, or the participant cannot be invoked, Paperclip must move the source issue to an explicit blocked/recovery path instead of leaving `in_review` to drift silently.
+
+### Failed result handoff
+
+A successful adapter result is not a completed control-plane handoff until the result, next action, next owner, idempotent wake, wake confirmation, and final issue status have been committed in that order. Comments are evidence only.
+
+If the one bounded corrective handoff attempt still leaves no valid disposition, the logical lifecycle state is `handoff_failed`. It is represented compatibly as issue status `blocked` plus a `missing_disposition` recovery action with cause `successful_run_missing_state`. The source issue retains its previous assignee; the recovery action has its own owner and wake path. Recovery must not silently transfer source accountability.
 
 ### Issue monitors
 

@@ -2016,6 +2016,14 @@ interface WakeupOptions {
   contextSnapshot?: Record<string, unknown>;
 }
 
+const IDEMPOTENT_WAKEUP_REQUEST_STATUSES = [
+  "queued",
+  "deferred_issue_execution",
+  "coalesced",
+  "claimed",
+  "completed",
+] as const;
+
 type UsageTotals = {
   inputTokens: number;
   cachedInputTokens: number;
@@ -14917,6 +14925,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
 
+        if (opts.idempotencyKey) {
+          await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended(${`${agent.companyId}:${opts.idempotencyKey}`}, 0))`,
+          );
+          const existingRequest = await tx
+            .select({ runId: agentWakeupRequests.runId })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+                inArray(agentWakeupRequests.status, [...IDEMPOTENT_WAKEUP_REQUEST_STATUSES]),
+              ),
+            )
+            .orderBy(desc(agentWakeupRequests.requestedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existingRequest) {
+            const existingRun = existingRequest.runId
+              ? await tx
+                .select()
+                .from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, existingRequest.runId))
+                .limit(1)
+                .then((rows) => rows[0] ?? null)
+              : null;
+            return { kind: "idempotent_existing" as const, run: existingRun };
+          }
+        }
+
         const issue = await tx
           .select({
             id: issues.id,
@@ -15674,6 +15712,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
+      if (outcome.kind === "idempotent_existing") return outcome.run;
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
@@ -15725,7 +15764,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       liveRunExecutions,
     );
 
-    if (coalescedTargetRun) {
+    if (coalescedTargetRun && !opts.idempotencyKey) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
@@ -15762,6 +15801,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
+
+      // The agent row lock serializes concurrent enqueue attempts for this agent.
+      // Re-check the idempotency key inside that lock: route-level preflight
+      // checks are advisory and two callers can otherwise both observe no row
+      // before either inserts its request.
+      if (opts.idempotencyKey) {
+        // Idempotency belongs to the company/change key, not to whichever agent
+        // happens to own the issue at this instant. The transaction-scoped
+        // advisory lock keeps a concurrent reassignment from enqueueing the same
+        // logical wake once for the old owner and once for the new owner.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`${agent.companyId}:${opts.idempotencyKey}`}, 0))`,
+        );
+        const existingRequest = await tx
+          .select({ runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              inArray(agentWakeupRequests.status, [...IDEMPOTENT_WAKEUP_REQUEST_STATUSES]),
+            ),
+          )
+          .orderBy(desc(agentWakeupRequests.requestedAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingRequest) {
+          const existingRun = existingRequest.runId
+            ? await tx
+              .select()
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, existingRequest.runId))
+              .limit(1)
+              .then((rows) => rows[0] ?? null)
+            : null;
+          return { kind: "idempotent_existing" as const, run: existingRun };
+        }
+      }
 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
@@ -15844,6 +15921,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (queueOutcome.kind === "skipped") return null;
+    if (queueOutcome.kind === "idempotent_existing") return queueOutcome.run;
     const newRun = queueOutcome.run;
 
     publishLiveEvent({
@@ -16566,6 +16644,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .orderBy(desc(heartbeatRuns.startedAt))
         .limit(1);
       return run ?? null;
+    },
+
+    getIssueExecutionPath: async (companyId: string, issueId: string, agentId: string) => {
+      const [run, wake] = await Promise.all([
+        db
+          .select({
+            id: heartbeatRuns.id,
+            agentId: heartbeatRuns.agentId,
+            status: heartbeatRuns.status,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, companyId),
+              eq(heartbeatRuns.agentId, agentId),
+              inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+              sql`(
+                ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
+                or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}
+              )`,
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null),
+        db
+          .select({
+            id: agentWakeupRequests.id,
+            agentId: agentWakeupRequests.agentId,
+            status: agentWakeupRequests.status,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
+              sql`(
+                ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}
+                or ${agentWakeupRequests.payload} ->> 'taskId' = ${issueId}
+                or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId' = ${issueId}
+                or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${issueId}
+              )`,
+            ),
+          )
+          .orderBy(desc(agentWakeupRequests.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null),
+      ]);
+      if (run) return { kind: "run" as const, ...run };
+      if (wake) return { kind: "wake" as const, ...wake };
+      return null;
     },
 
     getActiveRunIssueSummaryForAgent: async (agentId: string) => {

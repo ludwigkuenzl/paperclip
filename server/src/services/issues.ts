@@ -59,8 +59,10 @@ import {
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
+  isIssueLifecycleContractTransitionAllowed,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  type IssueLifecycleContractState,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -102,6 +104,7 @@ import {
 } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { resolveIssueLifecycleEnforcementModeForCompany } from "./issue-lifecycle-enforcement.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -149,10 +152,41 @@ function wakeDiagnosticActivityTargetsIssue(issueId: string) {
   )`;
 }
 
-function assertTransition(from: string, to: string) {
+function assertTransition(
+  companyId: string,
+  from: string,
+  to: string,
+  context?: {
+    activeRecoveryResolution?: boolean;
+    handoffRollback?: { committedStatus: string; previousStatus: string };
+  },
+) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
     throw conflict(`Unknown issue status: ${to}`);
+  }
+  if (
+    context?.handoffRollback?.committedStatus === from &&
+    context.handoffRollback.previousStatus === to
+  ) {
+    return;
+  }
+  if (
+    resolveIssueLifecycleEnforcementModeForCompany(companyId) === "enforce" &&
+    !isIssueLifecycleContractTransitionAllowed(
+      from as IssueLifecycleContractState,
+      to as IssueLifecycleContractState,
+    )
+  ) {
+    throw conflict(`Issue lifecycle contract does not allow transition ${from} -> ${to}`);
+  }
+  if (
+    resolveIssueLifecycleEnforcementModeForCompany(companyId) === "enforce" &&
+    from === "blocked" &&
+    (to === "done" || to === "in_review") &&
+    context?.activeRecoveryResolution !== true
+  ) {
+    throw conflict(`Issue lifecycle transition ${from} -> ${to} requires an active recovery resolution`);
   }
 }
 
@@ -2789,6 +2823,7 @@ function readSuccessfulRunHandoffFromActivity(row: {
 
   return {
     state,
+    lifecycleState: state === "escalated" ? "handoff_failed" : null,
     required: state === "required",
     sourceRunId:
       readStringFromRecord(details, "sourceRunId")
@@ -3188,7 +3223,7 @@ async function listIssueBlockedInboxAttentionMap(
     }
     const source = issueRef(row);
     const handoff = handoffMap.get(row.id);
-    if (handoff && (handoff.required || handoff.state === "escalated")) {
+    if (handoff && (handoff.required || handoff.lifecycleState === "handoff_failed")) {
       result.set(row.id, attentionBase({
         state: "missing_disposition",
         reason: "missing_successful_run_disposition",
@@ -6231,6 +6266,10 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        lifecycleTransitionContext?: {
+          activeRecoveryResolution?: boolean;
+          handoffRollback?: { committedStatus: string; previousStatus: string };
+        };
       },
       dbOrTx: any = db,
     ) => {
@@ -6246,6 +6285,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        lifecycleTransitionContext,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -6256,7 +6296,7 @@ export function issueService(db: Db) {
       }
 
       if (issueData.status) {
-        assertTransition(existing.status, issueData.status);
+        assertTransition(existing.companyId, existing.status, issueData.status, lifecycleTransitionContext);
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {
