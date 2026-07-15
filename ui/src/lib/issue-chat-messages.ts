@@ -1132,6 +1132,20 @@ export function buildIssueChatMessages(args: {
   for (const run of [...linkedRuns].sort((a, b) => toTimestamp(runTimestamp(a)) - toTimestamp(runTimestamp(b)))) {
     const transcript = transcriptsByRunId?.get(run.runId) ?? [];
     const hasRunOutput = transcript.length > 0 || (hasOutputForRun?.(run.runId) ?? false);
+    if (run.status === "queued") {
+      // A queued run has not started and produced no output: it must never
+      // render as a running/live message nor as a completed ("Run finished",
+      // internal status `complete`) transcript message. Surface a static
+      // queue-wait run row (amber "queued" RunStatusBadge) instead, so a queued
+      // run always reads as *waiting to start*, never as live and never as done.
+      // (GLA-1462 — fixes the GLA-1429 RunChatSurface linked-run path.)
+      orderedMessages.push({
+        createdAtMs: toTimestamp(runTimestamp(run)),
+        order: 2,
+        message: createHistoricalRunMessage(run, agentMap),
+      });
+      continue;
+    }
     if (hasRunOutput || run.status !== "succeeded") {
       // Always use the transcript message for non-succeeded runs (even before
       // transcript data loads) so the message type and fold header are stable
