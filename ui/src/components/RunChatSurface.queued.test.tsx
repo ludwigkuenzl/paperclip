@@ -5,8 +5,7 @@
 // stubbed thread) must read as a static queue-wait state — never as a live
 // "Running" run and never as a completed "Run finished" run.
 
-import type { ReactNode } from "react";
-import { flushSync } from "react-dom";
+import { act, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -81,15 +80,6 @@ vi.mock("@/lib/router", async (importOriginal) => {
   };
 });
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-// The branch's `import { act } from "react"` re-export is unusable, so drive
-// synchronous renders through flushSync (same pattern as RunChatSurface.test).
-function act(callback: () => void) {
-  flushSync(callback);
-}
-
 const queuedRun: LiveRunForIssue = {
   id: "run-queued-1",
   status: "queued",
@@ -114,9 +104,9 @@ describe("RunChatSurface queued run presentation (GLA-1462)", () => {
     document.body.innerHTML = "";
   });
 
-  it("shows a static queue-wait state, never Running or Run finished", () => {
+  it("shows a static queue-wait state, never Running or Run finished", async () => {
     const root = createRoot(container);
-    act(() => {
+    await act(async () => {
       root.render(
         <MemoryRouter>
           <RunChatSurface run={queuedRun} transcript={[]} hasOutput={false} />
@@ -137,7 +127,7 @@ describe("RunChatSurface queued run presentation (GLA-1462)", () => {
     expect(container.textContent).not.toContain("Working...");
     expect(container.textContent).not.toContain("Live now");
 
-    act(() => {
+    await act(async () => {
       root.unmount();
     });
   });

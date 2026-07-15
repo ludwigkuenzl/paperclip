@@ -3,7 +3,7 @@ import type { TranscriptEntry } from "../adapters";
 import type { LiveRunForIssue } from "../api/heartbeats";
 import { IssueChatThread } from "./IssueChatThread";
 import type { IssueChatLinkedRun } from "../lib/issue-chat-messages";
-import { isRunLive, isRunQueued, isRunWatched } from "../lib/run-queue-status";
+import { isRunLive, isRunQueued } from "../lib/run-queue-status";
 
 const EMPTY_COMMENTS: [] = [];
 const EMPTY_TIMELINE_EVENTS: [] = [];
@@ -24,16 +24,15 @@ export const RunChatSurface = memo(function RunChatSurface({
   hasOutput,
   companyId,
 }: RunChatSurfaceProps) {
-  // The watched-run path centrally distinguishes `running` from `queued`.
-  // Queued work must not fall through to historical rendering, which would
-  // incorrectly describe a not-yet-started run as finished.
+  // Only a truly-live (running) run drives the live/streaming message path. A
+  // queued run has produced no output and is surfaced through the static
+  // linked-run path, where it renders as waiting rather than live or complete.
   const live = isRunLive(run.status);
   const queued = isRunQueued(run.status);
-  const watched = isRunWatched(run.status);
-  const liveRuns = useMemo(() => (watched ? [run] : EMPTY_LIVE_RUNS), [run, watched]);
+  const liveRuns = useMemo(() => (live ? [run] : EMPTY_LIVE_RUNS), [live, run]);
   const linkedRuns = useMemo<IssueChatLinkedRun[]>(
     () =>
-      watched
+      live
         ? EMPTY_LINKED_RUNS
         : [{
             runId: run.id,
@@ -44,7 +43,7 @@ export const RunChatSurface = memo(function RunChatSurface({
             startedAt: run.startedAt,
             finishedAt: run.finishedAt,
           }],
-    [run, watched],
+    [live, run],
   );
   const transcriptsByRunId = useMemo(
     () => new Map([[run.id, transcript as readonly TranscriptEntry[]]]),

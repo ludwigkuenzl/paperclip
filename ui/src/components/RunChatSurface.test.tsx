@@ -71,11 +71,12 @@ describe("RunChatSurface thread presentation", () => {
     await cleanup();
   });
 
-  it("keeps a queued run on the watched-run path instead of marking it historical", async () => {
+  it("keeps a queued run on the static linked path instead of marking it live", async () => {
     const { container, cleanup } = await renderSurface({ ...run, status: "queued", startedAt: null });
     const thread = container.querySelector('[data-testid="nux-thread"]');
-    expect(thread?.getAttribute("data-live-count")).toBe("1");
-    expect(thread?.getAttribute("data-linked-count")).toBe("0");
+    expect(thread?.getAttribute("data-live-count")).toBe("0");
+    expect(thread?.getAttribute("data-linked-count")).toBe("1");
+    expect(thread?.getAttribute("data-linked-status")).toBe("queued");
     expect(thread?.getAttribute("data-empty-message")).toBe("Waiting to start…");
     await cleanup();
   });
