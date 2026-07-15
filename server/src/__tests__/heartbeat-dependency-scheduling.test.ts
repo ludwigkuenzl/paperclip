@@ -891,6 +891,379 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     }
   }, 40_000);
 
+  it("atomically starts only one assigned run for the same issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+    let finishFirstRun!: () => void;
+    const firstRunFinished = new Promise<void>((resolve) => {
+      finishFirstRun = resolve;
+    });
+
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await firstRunFinished;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "First same-issue run completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Atomic Issue Claim",
+      issuePrefix: `A${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "AtomicWorker",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "One issue, one executing owner",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: firstRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        createdAt: new Date("2026-07-15T00:00:00.000Z"),
+        updatedAt: new Date("2026-07-15T00:00:00.000Z"),
+      },
+      {
+        id: secondRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        createdAt: new Date("2026-07-15T00:00:01.000Z"),
+        updatedAt: new Date("2026-07-15T00:00:01.000Z"),
+      },
+    ]);
+    await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: firstRunId,
+        body: "First same-issue run completed.",
+      },
+      {
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: secondRunId,
+        body: "Second same-issue run completed.",
+      },
+    ]);
+
+    try {
+      await heartbeat.resumeQueuedRuns();
+      const firstStarted = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, firstRunId));
+        return run?.status === "running";
+      });
+      expect(firstStarted).toBe(true);
+
+      const [secondWhileFirstRuns] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, secondRunId));
+      const [issueWhileFirstRuns] = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(secondWhileFirstRuns?.status).toBe("queued");
+      expect(issueWhileFirstRuns?.executionRunId).toBe(firstRunId);
+      const callsForRun = (runId: string) => mockAdapterExecute.mock.calls.filter(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
+      );
+      const firstAdapterStarted = await waitForCondition(async () => callsForRun(firstRunId).length === 1);
+      expect(firstAdapterStarted).toBe(true);
+
+      finishFirstRun();
+      const secondSucceeded = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, secondRunId));
+        return run?.status === "succeeded";
+      }, 10_000);
+      expect(secondSucceeded).toBe(true);
+      expect(callsForRun(firstRunId)).toHaveLength(1);
+      expect(callsForRun(secondRunId)).toHaveLength(1);
+    } finally {
+      finishFirstRun();
+    }
+  }, 40_000);
+
+  it("serializes the same explicit resource while allowing different issues to queue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const firstIssueId = randomUUID();
+    const secondIssueId = randomUUID();
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+    let finishFirstRun!: () => void;
+    const firstRunFinished = new Promise<void>((resolve) => {
+      finishFirstRun = resolve;
+    });
+
+    mockAdapterExecute.mockImplementation(async (input: { runId: string }) => {
+      if (input.runId === firstRunId) await firstRunFinished;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: `Resource-controlled run ${input.runId} completed.`,
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Resource Claim",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ResourceWorker",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: firstIssueId,
+        companyId,
+        title: "Deploy first change",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        executionWorkspaceSettings: {
+          resourceControl: {
+            actionClass: "deploy",
+            resourceKey: "deploy:production",
+            changeId: "sha-first",
+            idempotencyKey: "deploy-production-sha-first",
+          },
+        },
+      },
+      {
+        id: secondIssueId,
+        companyId,
+        title: "Deploy second change",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        executionWorkspaceSettings: {
+          resourceControl: {
+            actionClass: "deploy",
+            resourceKey: "deploy:production",
+            changeId: "sha-second",
+            idempotencyKey: "deploy-production-sha-second",
+          },
+        },
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: firstRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId: firstIssueId, wakeReason: "issue_assigned" },
+        createdAt: new Date("2026-07-15T00:00:00.000Z"),
+        updatedAt: new Date("2026-07-15T00:00:00.000Z"),
+      },
+      {
+        id: secondRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId: secondIssueId, wakeReason: "issue_assigned" },
+        createdAt: new Date("2026-07-15T00:00:01.000Z"),
+        updatedAt: new Date("2026-07-15T00:00:01.000Z"),
+      },
+    ]);
+    await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId: firstIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: firstRunId,
+        body: "First resource-controlled run completed.",
+      },
+      {
+        companyId,
+        issueId: secondIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: secondRunId,
+        body: "Second resource-controlled run completed.",
+      },
+    ]);
+
+    try {
+      await heartbeat.resumeQueuedRuns();
+      const firstStarted = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, firstRunId));
+        return run?.status === "running";
+      });
+      expect(firstStarted).toBe(true);
+      const [waiting] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, secondRunId));
+      expect(waiting?.status).toBe("queued");
+      expect(mockAdapterExecute.mock.calls.filter(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === secondRunId,
+      )).toHaveLength(0);
+
+      finishFirstRun();
+      const secondSucceeded = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, secondRunId));
+        return run?.status === "succeeded";
+      }, 10_000);
+      expect(secondSucceeded).toBe(true);
+      expect(mockAdapterExecute.mock.calls.filter(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === secondRunId,
+      )).toHaveLength(1);
+    } finally {
+      finishFirstRun();
+    }
+  }, 40_000);
+
+  it("denies an exclusive resource action for a non-assignee mention run", async () => {
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const mentionedAgentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Resource Ownership",
+      issuePrefix: `O${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: ownerAgentId,
+        companyId,
+        name: "DeployOwner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: mentionedAgentId,
+        companyId,
+        name: "MentionedReviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Owner-only deployment",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: ownerAgentId,
+      responsibleUserId: "responsible-user",
+      executionWorkspaceSettings: {
+        resourceControl: {
+          actionClass: "deploy",
+          resourceKey: "deploy:production",
+          changeId: "sha-owner-only",
+          idempotencyKey: "deploy-production-sha-owner-only",
+        },
+      },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: mentionedAgentId,
+      invocationSource: "mention",
+      triggerDetail: "agent_mention",
+      status: "queued",
+      contextSnapshot: { issueId, commentId: randomUUID(), wakeReason: "issue_comment_mentioned" },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    const denied = await waitForCondition(async () => {
+      const [run] = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      return run?.status === "cancelled" && run.errorCode === "resource_control_denied";
+    });
+    expect(denied).toBe(true);
+    expect(mockAdapterExecute.mock.calls.filter(
+      (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
+    )).toHaveLength(0);
+  });
+
   it("cancels stale queued runs when issue blockers are still unresolved", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

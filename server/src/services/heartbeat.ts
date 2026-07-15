@@ -206,6 +206,14 @@ import {
 } from "./recovery/model-profile-hint.js";
 import { recoveryService } from "./recovery/service.js";
 import { reconcileDeliveryControlShadow } from "./delivery-control-shadow.js";
+import { resolveIssueResourceControl } from "./resource-control.js";
+import {
+  acquireResourceControlLease,
+  listResourceQueueTelemetry,
+  releaseResourceControlLeaseForRun,
+  renewResourceControlLeaseForRun,
+  type ResourceControlLeaseDecision,
+} from "./resource-control-leases.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
@@ -268,6 +276,13 @@ import {
   type EffectiveRunConfigSecretManifestEntry,
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+
+class QueuedRunIssueLockConflict extends Error {
+  constructor() {
+    super("Queued run could not acquire the assigned issue execution lock");
+    this.name = "QueuedRunIssueLockConflict";
+  }
+}
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -541,6 +556,8 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+const resourceLeaseRenewedAtByRun = new Map<string, number>();
+const RESOURCE_LEASE_RENEWAL_INTERVAL_MS = 60_000;
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
 type RuntimeConfigSecretResolver = Pick<
@@ -5797,6 +5814,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
+    const lastRenewedAt = resourceLeaseRenewedAtByRun.get(run.id) ?? 0;
+    if (Date.now() - lastRenewedAt >= RESOURCE_LEASE_RENEWAL_INTERVAL_MS) {
+      const lease = await renewResourceControlLeaseForRun(db, run.id);
+      if (lease?.status === "recovery_required") {
+        throw new Error(`Resource lease for run ${run.id} expired before renewal; recovery is required`);
+      }
+      if (lease) resourceLeaseRenewedAtByRun.set(run.id, Date.now());
+    }
+
     return recordHeartbeatRunRuntimeProgress(currentRun, update, issueId);
   }
 
@@ -10307,18 +10333,190 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!claimed) return null;
+    const claimedWakeReason = readNonEmptyString(context.wakeReason);
+    let claimed: typeof heartbeatRuns.$inferSelect | null;
+    let resourceLeaseDecision: ResourceControlLeaseDecision | null = null;
+    try {
+      const transactionResult = await db.transaction(async (tx) => {
+        let locksAssignedIssue = false;
+        let leaseDecision: ResourceControlLeaseDecision | null = null;
+        if (issueId && claimedWakeReason !== "source_scoped_recovery_action") {
+          const lockedIssue = await tx
+            .select({
+              id: issues.id,
+              companyId: issues.companyId,
+              status: issues.status,
+              workMode: issues.workMode,
+              projectId: issues.projectId,
+              projectWorkspaceId: issues.projectWorkspaceId,
+              executionWorkspaceId: issues.executionWorkspaceId,
+              executionWorkspaceSettings: issues.executionWorkspaceSettings,
+              assigneeAgentId: issues.assigneeAgentId,
+              executionRunId: issues.executionRunId,
+            })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!lockedIssue) throw new QueuedRunIssueLockConflict();
+          // Mention/context runs may inspect an issue without owning its execution
+          // lock. Assigned work must acquire that lock in the same transaction as
+          // the queued -> running CAS, so no adapter can start without ownership.
+          locksAssignedIssue = lockedIssue.assigneeAgentId === run.agentId;
+          if (
+            locksAssignedIssue &&
+            (
+              lockedIssue.status === "done" ||
+              lockedIssue.status === "cancelled" ||
+              (lockedIssue.executionRunId !== null && lockedIssue.executionRunId !== run.id)
+            )
+          ) {
+            throw new QueuedRunIssueLockConflict();
+          }
+
+          const resourceControl = resolveIssueResourceControl(lockedIssue);
+          if (
+            resourceControl.source === "explicit" &&
+            resourceControl.leaseRequired
+          ) {
+            if (!locksAssignedIssue) {
+              leaseDecision = {
+                outcome: "denied",
+                lease: null,
+                blockingRunId: null,
+                reason: "exclusive_action_requires_assigned_issue_owner",
+                nextCheckAt: null,
+              };
+            } else if (
+              resourceControl.blockedReason ||
+              !resourceControl.changeId ||
+              !resourceControl.idempotencyKey
+            ) {
+              leaseDecision = {
+                outcome: "denied",
+                lease: null,
+                blockingRunId: null,
+                reason: resourceControl.blockedReason ?? "resource_change_context_required",
+                nextCheckAt: null,
+              };
+            } else {
+              leaseDecision = await acquireResourceControlLease(tx, {
+                companyId: run.companyId,
+                issueId,
+                runId: run.id,
+                actionClass: resourceControl.actionClass,
+                resourceKey: resourceControl.resourceKey,
+                changeId: resourceControl.changeId,
+                idempotencyKey: resourceControl.idempotencyKey,
+              });
+            }
+            if (leaseDecision.outcome !== "acquired" && leaseDecision.outcome !== "owned") {
+              return { claimedRun: null, leaseDecision };
+            }
+          }
+        }
+
+        const claimedRun = await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            responsibleUserId,
+            startedAt: run.startedAt ?? claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!claimedRun) throw new QueuedRunIssueLockConflict();
+
+        if (issueId && locksAssignedIssue) {
+          const locked = await tx
+            .update(issues)
+            .set({
+              executionRunId: claimedRun.id,
+              executionAgentNameKey: normalizeAgentNameKey(agent.name),
+              executionLockedAt: claimedAt,
+              updatedAt: claimedAt,
+            })
+            .where(and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, claimedRun.companyId),
+              eq(issues.assigneeAgentId, claimedRun.agentId),
+              or(isNull(issues.executionRunId), eq(issues.executionRunId, claimedRun.id)),
+            ))
+            .returning({ id: issues.id })
+            .then((rows) => rows[0] ?? null);
+          if (!locked) throw new QueuedRunIssueLockConflict();
+        }
+        return { claimedRun, leaseDecision };
+      });
+      claimed = transactionResult.claimedRun;
+      resourceLeaseDecision = transactionResult.leaseDecision;
+    } catch (error) {
+      if (error instanceof QueuedRunIssueLockConflict) {
+        logger.info(
+          { runId: run.id, issueId, agentId: run.agentId },
+          "claimQueuedRun: assigned issue execution lock is held by another run",
+        );
+        return null;
+      }
+      throw error;
+    }
+    if (!claimed) {
+      if (resourceLeaseDecision) {
+        logger.info(
+          {
+            runId: run.id,
+            issueId,
+            outcome: resourceLeaseDecision.outcome,
+            blockingRunId: resourceLeaseDecision.blockingRunId,
+            reason: resourceLeaseDecision.reason,
+            nextCheckAt: resourceLeaseDecision.nextCheckAt,
+          },
+          "claimQueuedRun: resource-control decision prevented claim",
+        );
+        if (
+          resourceLeaseDecision.outcome === "denied" ||
+          resourceLeaseDecision.outcome === "replay_confirmed"
+        ) {
+          const finishedAt = new Date();
+          const errorCode = resourceLeaseDecision.outcome === "replay_confirmed"
+            ? "resource_change_already_completed"
+            : "resource_control_denied";
+          const terminalRun = await setRunStatus(run.id, "cancelled", {
+            finishedAt,
+            error: resourceLeaseDecision.reason,
+            errorCode,
+            resultJson: {
+              ...parseObject(run.resultJson),
+              resourceControlOutcome: resourceLeaseDecision.outcome,
+              blockingRunId: resourceLeaseDecision.blockingRunId,
+            },
+          });
+          await setWakeupStatus(run.wakeupRequestId, "skipped", {
+            finishedAt,
+            error: resourceLeaseDecision.reason,
+          });
+          if (terminalRun) {
+            await appendRunEvent(terminalRun, await nextRunEventSeq(terminalRun.id), {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "resource-controlled run did not start",
+              payload: {
+                outcome: resourceLeaseDecision.outcome,
+                reason: resourceLeaseDecision.reason,
+                blockingRunId: resourceLeaseDecision.blockingRunId,
+              },
+            });
+          }
+        }
+      }
+      return null;
+    }
+    if (resourceLeaseDecision?.lease) {
+      resourceLeaseRenewedAtByRun.set(claimed.id, claimedAt.getTime());
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -10338,33 +10536,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     publishRunLifecyclePluginEvent(claimed);
 
     await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
-
-    // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
-    // not at queue time. Guard is idempotent — safe if called more than once.
-    const claimedContext = parseObject(claimed.contextSnapshot);
-    const claimedIssueId = readNonEmptyString(claimedContext.issueId);
-    const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
-    if (claimedIssueId && claimedWakeReason !== "source_scoped_recovery_action") {
-      const claimedAgent = await getAgent(claimed.agentId);
-      await db
-        .update(issues)
-        .set({
-          executionRunId: claimed.id,
-          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-          executionLockedAt: claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(
-          and(
-            eq(issues.id, claimedIssueId),
-            eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
-            or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
-          ),
-        );
-    }
 
     return claimed;
   }
@@ -11310,6 +11481,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
     let runScratch: HeartbeatRunScratch | null = null;
+    let resourceLeaseRenewalTimer: NodeJS.Timeout | null = null;
+    if (resourceLeaseRenewedAtByRun.has(run.id)) {
+      resourceLeaseRenewalTimer = setInterval(() => {
+        void renewResourceControlLeaseForRun(db, run.id)
+          .then(async (lease) => {
+            if (!lease) return;
+            if (lease.status === "recovery_required") {
+              await cancelRunInternal(
+                run.id,
+                "Cancelled because the resource-control lease expired before renewal",
+                { errorCode: "resource_lease_expired" },
+              );
+              return;
+            }
+            resourceLeaseRenewedAtByRun.set(run.id, Date.now());
+          })
+          .catch((leaseRenewalError) => {
+            logger.error(
+              { err: leaseRenewalError, runId: run.id },
+              "failed to renew active resource-control lease",
+            );
+          });
+      }, RESOURCE_LEASE_RENEWAL_INTERVAL_MS);
+      resourceLeaseRenewalTimer.unref();
+    }
 
     try {
     const agent = await getAgent(run.agentId);
@@ -13742,7 +13938,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
           }
         } finally {
+          if (resourceLeaseRenewalTimer) clearInterval(resourceLeaseRenewalTimer);
           const latestRun = await getRun(run.id).catch(() => null);
+          if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+            await releaseResourceControlLeaseForRun(db, {
+              runId: run.id,
+              terminalStatus: latestRun.status,
+            }).catch((leaseReleaseError) => {
+              logger.error(
+                { err: leaseReleaseError, runId: run.id },
+                "failed to release resource-control lease after terminal run",
+              );
+            });
+          }
+          resourceLeaseRenewedAtByRun.delete(run.id);
           await releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,
@@ -16288,6 +16497,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .orderBy(desc(heartbeatRuns.createdAt));
 
       const rows = limit ? await query.limit(limit) : await query;
+      const resourceQueueTelemetryByRunId = await listResourceQueueTelemetry(
+        db,
+        companyId,
+        rows.map((row) => row.id),
+      );
       return rows.map((row) => {
         const {
           contextIssueId,
@@ -16318,6 +16532,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         return {
           ...rest,
+          resourceQueueTelemetry: resourceQueueTelemetryByRunId.get(rest.id) ?? null,
           contextSnapshot: summarizeHeartbeatRunContextSnapshot({
             issueId: contextIssueId,
             taskId: contextTaskId,
@@ -16344,6 +16559,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     getRun,
+
+    listResourceQueueTelemetry: (companyId: string, runIds?: string[]) =>
+      listResourceQueueTelemetry(db, companyId, runIds),
 
     decorateActiveRunStatus: decorateHeartbeatRunRuntimeStatus,
     recordRuntimeProgress: recordCurrentHeartbeatRunRuntimeProgress,

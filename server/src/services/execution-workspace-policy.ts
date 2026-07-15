@@ -1,9 +1,10 @@
-import type {
-  ExecutionWorkspaceMode,
-  ExecutionWorkspaceStrategy,
-  IssueExecutionWorkspaceSettings,
-  ProjectExecutionWorkspaceDefaultMode,
-  ProjectExecutionWorkspacePolicy,
+import {
+  isDeliveryControlActionClass,
+  type ExecutionWorkspaceMode,
+  type ExecutionWorkspaceStrategy,
+  type IssueExecutionWorkspaceSettings,
+  type ProjectExecutionWorkspaceDefaultMode,
+  type ProjectExecutionWorkspacePolicy,
 } from "@paperclipai/shared";
 import { asString, parseObject } from "../adapters/utils.js";
 
@@ -182,6 +183,21 @@ export function parseIssueExecutionWorkspaceSettings(
     if (mode === "isolated") return "isolated_workspace";
     return "";
   })();
+  const rawResourceControl = parseObject(parsed.resourceControl);
+  const resourceActionClass = asString(rawResourceControl.actionClass, "");
+  const resourceKey = asString(rawResourceControl.resourceKey, "").trim();
+  const resourceControl = isDeliveryControlActionClass(resourceActionClass) && resourceKey
+    ? {
+        actionClass: resourceActionClass,
+        resourceKey,
+        ...(typeof rawResourceControl.changeId === "string" && rawResourceControl.changeId.trim()
+          ? { changeId: rawResourceControl.changeId.trim() }
+          : {}),
+        ...(typeof rawResourceControl.idempotencyKey === "string" && rawResourceControl.idempotencyKey.trim()
+          ? { idempotencyKey: rawResourceControl.idempotencyKey.trim() }
+          : {}),
+      }
+    : null;
   return {
     ...(normalizedMode
       ? { mode: normalizedMode as IssueExecutionWorkspaceSettings["mode"] }
@@ -193,6 +209,7 @@ export function parseIssueExecutionWorkspaceSettings(
     ...(parsed.workspaceRuntime && typeof parsed.workspaceRuntime === "object" && !Array.isArray(parsed.workspaceRuntime)
       ? { workspaceRuntime: { ...(parsed.workspaceRuntime as Record<string, unknown>) } }
       : {}),
+    ...(resourceControl ? { resourceControl } : {}),
   };
 }
 

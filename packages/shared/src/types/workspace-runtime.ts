@@ -1,4 +1,5 @@
 import type { TrustAuthorizationPolicy } from "../trust-policy.js";
+import type { DeliveryControlActionClass } from "../delivery-control-contract.js";
 
 export type ExecutionWorkspaceStrategyType =
   | "project_primary"
@@ -165,6 +166,12 @@ export interface IssueExecutionWorkspaceSettings {
   environmentId?: string | null;
   workspaceStrategy?: ExecutionWorkspaceStrategy | null;
   workspaceRuntime?: Record<string, unknown> | null;
+  resourceControl?: {
+    actionClass: DeliveryControlActionClass;
+    resourceKey: string;
+    changeId?: string | null;
+    idempotencyKey?: string | null;
+  } | null;
 }
 
 export interface ExecutionWorkspaceSummary {

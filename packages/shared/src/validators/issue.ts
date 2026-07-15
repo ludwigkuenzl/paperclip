@@ -32,6 +32,7 @@ import {
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
+import { DELIVERY_CONTROL_ACTION_CLASSES } from "../delivery-control-contract.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
@@ -122,6 +123,12 @@ export const issueExecutionWorkspaceSettingsSchema = z
     environmentId: z.string().uuid().optional().nullable(),
     workspaceStrategy: executionWorkspaceStrategySchema.optional().nullable(),
     workspaceRuntime: z.record(z.string(), z.unknown()).optional().nullable(),
+    resourceControl: z.object({
+      actionClass: z.enum(DELIVERY_CONTROL_ACTION_CLASSES),
+      resourceKey: z.string().trim().min(1).max(512),
+      changeId: z.string().trim().min(1).max(512).optional().nullable(),
+      idempotencyKey: z.string().trim().min(1).max(1_024).optional().nullable(),
+    }).strict().optional().nullable(),
   })
   .strict();
 

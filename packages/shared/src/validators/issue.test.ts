@@ -66,6 +66,32 @@ describe("issue validators", () => {
     expect(updated).not.toHaveProperty("responsibleUserId");
   });
 
+  it("accepts explicit resource-control metadata and rejects incomplete resource identities", () => {
+    const parsed = createIssueSchema.parse({
+      title: "Deploy one versioned release",
+      executionWorkspaceSettings: {
+        mode: "operator_branch",
+        resourceControl: {
+          actionClass: "deploy",
+          resourceKey: "vps:production",
+          changeId: "sha-123",
+          idempotencyKey: "deploy:production:sha-123",
+        },
+      },
+    });
+    expect(parsed.executionWorkspaceSettings?.resourceControl).toMatchObject({
+      actionClass: "deploy",
+      resourceKey: "vps:production",
+      changeId: "sha-123",
+    });
+    expect(createIssueSchema.safeParse({
+      title: "Missing resource key",
+      executionWorkspaceSettings: {
+        resourceControl: { actionClass: "external_action", resourceKey: "" },
+      },
+    }).success).toBe(false);
+  });
+
   it("allows false-positive recovery resolutions to atomically restore the source issue status", () => {
     expect(
       resolveIssueRecoveryActionSchema.parse({

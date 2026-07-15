@@ -7,6 +7,7 @@ import type {
   WakeupTriggerDetail,
   WakeupRequestStatus,
 } from "../constants.js";
+import type { DeliveryControlResourceQueueTelemetry } from "../delivery-control-contract.js";
 
 export type GitWorktreeBranchAncestryVerdict = "ancestor" | "diverged" | "unknown";
 
@@ -113,6 +114,7 @@ export interface HeartbeatRun {
   createdAt: Date;
   updatedAt: Date;
   outputSilence?: HeartbeatRunOutputSilence;
+  resourceQueueTelemetry?: DeliveryControlResourceQueueTelemetry | null;
   /**
    * Ephemeral, process-local current status message for an active run. Resolved
    * from the in-memory runtime status store (never persisted to the database)

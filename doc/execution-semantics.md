@@ -1,7 +1,7 @@
 # Execution Semantics
 
 Status: Current implementation guide
-Date: 2026-07-14
+Date: 2026-07-15
 Audience: Product and engineering
 
 This document explains how Paperclip interprets issue assignment, issue status, execution runs, wakeups, parent/sub-issue structure, and blocker relationships.
@@ -47,6 +47,28 @@ Promote only a bounded canary after each observed case is classified as a true v
 | exhausted successful-run handoff | Recovery blocked the source, but recovery ownership could overwrite the source assignee and obscure failed accountability. | Delivery is transactional-or-compensating: when the ordered handoff cannot be confirmed, logical state is `handoff_failed`; the source is blocked, retains its previous owner, and exposes a separately owned recovery action with one bounded wake path. |
 
 The rollout flag changes only mutation/wake enforcement. The transaction-level idempotency and previous-owner retention fixes are invariant repairs and remain active in every mode. No M1 path requires replaying old exports or rewriting existing issue rows.
+
+## Resource-control canary contract
+
+The machine-readable action-class and lease contract is exported from `packages/shared/src/delivery-control-contract.ts`. It defines `read_only`, `review`, `vault_write`, and `isolated_write` as parallel-safe without a Paperclip resource lease. `shared_write`, `deploy`, and `external_action` require an exclusive lease before their adapter run may start.
+
+Resource enforcement is opt-in per issue during the canary phase. An issue opts in through `executionWorkspaceSettings.resourceControl` with an explicit `actionClass`, concrete `resourceKey`, stable `changeId`, and stable `idempotencyKey`. Issues without that explicit block retain the previous scheduling behavior; Paperclip does not infer permission for external parallel writes, and this slice does not raise any agent's general `maxConcurrentRuns` value.
+
+For an opted-in exclusive action, Paperclip:
+
+- takes a company/resource PostgreSQL transaction lock before inspecting or creating the durable lease
+- stores one active lease per `(companyId, resourceKey)` with a monotonically increasing fencing token
+- claims the lease, the queued heartbeat run, and the assigned issue execution lock in one transaction
+- renews a live lease from runtime progress at most once per minute
+- leaves conflicting runs `queued` instead of starting their adapters
+- exposes `actionClass`, `resourceKey`, `waitReason`, `blockingRunId`, `waitingSinceAt`, `queuePosition`, and `nextCheckAt` on run read models
+- releases the lease when the owner run becomes terminal, without claiming that a successful process exit proves external target-state readback
+
+An expired lease is changed to `recovery_required`; it is never automatically stolen. A same-idempotency retry is also held until the target state is read back. Only a succeeded owner run plus an explicit target-state readback can change the audit row to `completed` and make a subsequent identical request a confirmed replay rather than another external action.
+
+The assigned-issue execution lock follows the same atomicity rule even when resource control is not opted in: `heartbeat_runs.status = running` and `issues.executionRunId = run.id` are committed together under an issue-row lock. If another run already owns the assigned issue, the later run stays queued and no second adapter starts.
+
+This is the backend canary foundation, not authorization to enable general external parallelism. Promotion still requires target-specific ownership/readback integration, bounded expired-lease recovery, UI verification, role concurrency canaries, deployment readback, and tested rollback. The compatibility rollback before promotion is to remove the issue's explicit `resourceControl` block and keep existing agent concurrency limits; a code rollback must revert the canary commit while retaining the additive lease table for audit/history until a separately reviewed data-retention decision is made.
 
 ## 1. Core Model
 

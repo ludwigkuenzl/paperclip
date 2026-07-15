@@ -3655,15 +3655,25 @@ export function agentRoutes(
         .limit(targetRunCount - liveRuns.length);
 
       const rows = [...liveRuns, ...recentRuns];
+      const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(
+        companyId,
+        rows.map((run) => run.id),
+      );
       res.json(await Promise.all(rows.map(async (run) => ({
         ...heartbeat.decorateActiveRunStatus(run),
+        resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
         outputSilence: await heartbeat.buildRunOutputSilence(run),
       }))));
       return;
     }
 
+    const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(
+      companyId,
+      liveRuns.map((run) => run.id),
+    );
     res.json(await Promise.all(liveRuns.map(async (run) => ({
       ...heartbeat.decorateActiveRunStatus(run),
+      resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
       outputSilence: await heartbeat.buildRunOutputSilence(run),
     }))));
   });
@@ -3674,9 +3684,15 @@ export function agentRoutes(
     if (!run) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
+    const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(run.companyId, [run.id]);
     res.json(
       redactCurrentUserValue(
-        { ...decoratedRun, retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        {
+          ...decoratedRun,
+          retryExhaustedReason,
+          resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+        },
         await getCurrentUserRedactionOptions(),
       ),
     );
@@ -3846,8 +3862,13 @@ export function agentRoutes(
       )
       .orderBy(desc(heartbeatRuns.createdAt));
 
+    const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(
+      issue.companyId,
+      liveRuns.map((run) => run.id),
+    );
     res.json(await Promise.all(liveRuns.map(async (run) => ({
       ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
+      resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
       outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
     }))));
   });
@@ -3894,8 +3915,10 @@ export function agentRoutes(
     }
 
     const decoratedRun = heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id });
+    const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(issue.companyId, [run.id]);
     res.json({
       ...decoratedRun,
+      resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
       agentId: agent.id,
       agentName: agent.name,
       adapterType: agent.adapterType,

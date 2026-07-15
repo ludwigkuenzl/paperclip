@@ -291,6 +291,30 @@ describe("execution workspace policy helpers", () => {
       mode: "shared_workspace",
       environmentId: "11111111-1111-4111-8111-111111111111",
     });
+    expect(
+      parseIssueExecutionWorkspaceSettings({
+        mode: "operator_branch",
+        resourceControl: {
+          actionClass: "deploy",
+          resourceKey: "vps:production",
+          changeId: "sha-123",
+          idempotencyKey: "deploy:production:sha-123",
+        },
+      }),
+    ).toEqual({
+      mode: "operator_branch",
+      resourceControl: {
+        actionClass: "deploy",
+        resourceKey: "vps:production",
+        changeId: "sha-123",
+        idempotencyKey: "deploy:production:sha-123",
+      },
+    });
+    expect(
+      parseIssueExecutionWorkspaceSettings({
+        resourceControl: { actionClass: "unknown", resourceKey: "vps:production" },
+      }),
+    ).toEqual({});
   });
 
   it("prefers the agent default environment", () => {
