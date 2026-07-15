@@ -23,7 +23,7 @@ describe("pause durability: continuation retry classification", () => {
   it("timed_out (timeout) still retries as transient infra", () => {
     const c = classifyContinuationFailure(run("timeout"));
     expect(c.kind).toBe("transient_infra");
-    expect(c.maxAttempts).toBeGreaterThan(0);
+    expect(c.maxAttempts).toBe(2);
   });
 
   it("generic cancelled (non-pause cancellation) is NOT non-retryable", () => {
@@ -32,7 +32,8 @@ describe("pause durability: continuation retry classification", () => {
   });
 
   it("genuine failure with no/unknown code retries via default branch", () => {
-    expect(classifyContinuationFailure(run(null)).kind).toBe("default");
-    expect(classifyContinuationFailure(run("some_adapter_error")).kind).toBe("default");
+    const unknown = classifyContinuationFailure(run("some_adapter_error"));
+    expect(classifyContinuationFailure(run(null))).toMatchObject({ kind: "default", maxAttempts: 2 });
+    expect(unknown).toMatchObject({ kind: "default", maxAttempts: 2 });
   });
 });

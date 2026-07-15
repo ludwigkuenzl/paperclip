@@ -3860,6 +3860,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         retryReason: "issue_continuation_needed",
         retryOfRunId: runId,
         source: "issue.continuation_recovery",
+        deliveryControlRecoveryAttempt: 1,
       });
       expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
 
@@ -4708,11 +4709,34 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes.some((row) => row.reason === "run_liveness_continuation")).toBe(false);
   });
-  it("blocks stranded in-progress work after the continuation retry was already used", async () => {
+  it("blocks stranded in-progress work after two continuation attempts were used", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
+    });
+    const olderAttemptAt = new Date("2026-03-18T23:55:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+        source: "issue.continuation_recovery",
+        deliveryControlRecoveryAttempt: 1,
+      },
+      errorCode: "process_lost",
+      error: "run failed before issue advanced",
+      startedAt: olderAttemptAt,
+      finishedAt: olderAttemptAt,
+      createdAt: olderAttemptAt,
+      updatedAt: olderAttemptAt,
     });
     const heartbeat = heartbeatService(db);
 
@@ -4748,6 +4772,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
       runErrorCode: "adapter_exit_code",
       runError: null,
+    });
+    const olderAttemptAt = new Date("2026-03-18T23:55:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+        source: "issue.continuation_recovery",
+        deliveryControlRecoveryAttempt: 1,
+      },
+      errorCode: "adapter_exit_code",
+      error: null,
+      startedAt: olderAttemptAt,
+      finishedAt: olderAttemptAt,
+      createdAt: olderAttemptAt,
+      updatedAt: olderAttemptAt,
     });
     const heartbeat = heartbeatService(db);
 
@@ -4812,9 +4859,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "adapter_failed",
       runError: "ssh: connection reset",
     });
-    // Backfill two more consecutive failed continuation retries so the cap (3) is reached.
+    // Backfill one more consecutive failed continuation retry so the cap (2) is reached.
     const olderTimestamps = [
-      new Date("2026-03-18T23:50:00.000Z"),
       new Date("2026-03-18T23:55:00.000Z"),
     ];
     for (const finishedAt of olderTimestamps) {
@@ -4862,11 +4908,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("retried continuation");
-    expect(comments[0]?.body).toContain("3× attempts");
+    expect(comments[0]?.body).toContain("2× attempts");
     expect(comments[0]?.body).toContain("Latest cause: `adapter_failed`");
   });
 
-  it("does not count mixed-cause continuation failures toward the transient cap", async () => {
+  it("counts mixed-cause continuation failures toward the global two-attempt cap", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -4892,82 +4938,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
         errorCode: "timeout",
         error: "request timed out",
-        startedAt: new Date("2026-03-18T23:45:00.000Z"),
-        finishedAt: new Date("2026-03-18T23:45:00.000Z"),
-        createdAt: new Date("2026-03-18T23:45:00.000Z"),
-        updatedAt: new Date("2026-03-18T23:45:00.000Z"),
-      },
-      {
-        id: randomUUID(),
-        companyId,
-        agentId,
-        invocationSource: "automation",
-        triggerDetail: "system",
-        status: "failed",
-        contextSnapshot: {
-          issueId,
-          taskId: issueId,
-          wakeReason: "issue_continuation_needed",
-          retryReason: "issue_continuation_needed",
-          source: "issue.continuation_recovery",
-        },
-        errorCode: "timeout",
-        error: "request timed out",
         startedAt: new Date("2026-03-18T23:50:00.000Z"),
         finishedAt: new Date("2026-03-18T23:50:00.000Z"),
         createdAt: new Date("2026-03-18T23:50:00.000Z"),
         updatedAt: new Date("2026-03-18T23:50:00.000Z"),
-      },
-      {
-        id: randomUUID(),
-        companyId,
-        agentId,
-        invocationSource: "automation",
-        triggerDetail: "system",
-        status: "failed",
-        contextSnapshot: {
-          issueId,
-          taskId: issueId,
-          wakeReason: "issue_continuation_needed",
-          retryReason: "issue_continuation_needed",
-          source: "issue.continuation_recovery",
-        },
-        errorCode: "adapter_failed",
-        error: "ssh: connection reset",
-        startedAt: new Date("2026-03-18T23:55:00.000Z"),
-        finishedAt: new Date("2026-03-18T23:55:00.000Z"),
-        createdAt: new Date("2026-03-18T23:55:00.000Z"),
-        updatedAt: new Date("2026-03-18T23:55:00.000Z"),
       },
     ]);
 
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
-    expect(result.continuationRequeued).toBe(1);
-    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
     expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("in_progress");
+    expect(issue?.status).toBe("blocked");
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toHaveLength(5);
-    const retryRun = runs.find((row) => {
-      const ctx = row.contextSnapshot as Record<string, unknown> | null;
-      return row.id !== runId &&
-        row.errorCode === null &&
-        ctx?.retryReason === "issue_continuation_needed" &&
-        ctx?.source === "issue.continuation_recovery";
-    });
-    expect(retryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
-      issueId,
-      retryReason: "issue_continuation_needed",
-      source: "issue.continuation_recovery",
-    });
-    if (retryRun) {
-      await waitForRunToSettle(heartbeat, retryRun.id);
-    }
+    expect(runs).toHaveLength(3);
+    expect(runs.some((row) => {
+      const context = row.contextSnapshot as Record<string, unknown> | null;
+      return row.errorCode === null && context?.source === "issue.continuation_recovery";
+    })).toBe(false);
   });
 
   it("escalates non-retryable continuation failures immediately without enqueuing another retry", async () => {
@@ -5040,10 +5033,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("reuses the raced stranded recovery issue when duplicate active recovery creation conflicts", async () => {
-    const { companyId, issueId } = await seedStrandedIssueFixture({
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
+    });
+    const olderAttemptAt = new Date("2026-03-18T23:55:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+        source: "issue.continuation_recovery",
+        deliveryControlRecoveryAttempt: 1,
+      },
+      errorCode: "process_lost",
+      error: "run failed before issue advanced",
+      startedAt: olderAttemptAt,
+      finishedAt: olderAttemptAt,
+      createdAt: olderAttemptAt,
+      updatedAt: olderAttemptAt,
     });
     const heartbeat = heartbeatService(db);
 

@@ -918,6 +918,18 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        try {
+          const deliveryControlReconciled = await heartbeat.reconcilePriorityDeliveryControl();
+          if (deliveryControlReconciled.observed > 0 || deliveryControlReconciled.failed > 0) {
+            logger.info(
+              { ...deliveryControlReconciled },
+              "startup delivery-control shadow evaluation recorded SLA/liveness deltas",
+            );
+          }
+        } catch (err) {
+          logger.warn({ err }, "startup delivery-control shadow evaluation failed open");
+        }
+
         const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
@@ -1048,6 +1060,19 @@ export async function startServer(): Promise<StartedServer> {
               const reconciled = await heartbeat.reconcileIssueGraphLiveness();
               if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
                 logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
+              }
+            })
+            .then(async () => {
+              try {
+                const reconciled = await heartbeat.reconcilePriorityDeliveryControl();
+                if (reconciled.observed > 0 || reconciled.failed > 0) {
+                  logger.info(
+                    { ...reconciled },
+                    "periodic delivery-control shadow evaluation recorded SLA/liveness deltas",
+                  );
+                }
+              } catch (err) {
+                logger.warn({ err }, "periodic delivery-control shadow evaluation failed open");
               }
             })
             .then(async () => {

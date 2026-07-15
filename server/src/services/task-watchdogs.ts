@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   approvals,
@@ -99,7 +100,10 @@ export type TaskWatchdogClassifierRelation = {
 export type TaskWatchdogClassifierConfig = Pick<
   IssueWatchdogSummary,
   "companyId" | "issueId" | "lastReviewedFingerprint"
->;
+> & {
+  watchdogAgentId?: string | null;
+  instructions?: string | null;
+};
 
 export type TaskWatchdogStoppedLeaf = {
   issueId: string;
@@ -269,15 +273,35 @@ function waitingPathIds(
 function stableStopFingerprint(input: {
   companyId: string;
   watchedIssueId: string;
+  watchdogAgentId?: string | null;
+  instructions?: string | null;
   leaves: TaskWatchdogStoppedLeaf[];
 }) {
   const payload = JSON.stringify({
-    version: 1,
+    version: 2,
     companyId: input.companyId,
     watchedIssueId: input.watchedIssueId,
+    watchdogAgentId: input.watchdogAgentId ?? null,
+    instructions: normalizeInstructions(input.instructions),
     leaves: input.leaves,
   });
   return `task_watchdog_stop:${createHash("sha256").update(payload).digest("hex")}`;
+}
+
+function stableWatchdogConfigurationFingerprint(watchdog: {
+  companyId: string;
+  issueId: string;
+  watchdogAgentId: string;
+  instructions?: string | null;
+}) {
+  const payload = JSON.stringify({
+    version: 1,
+    companyId: watchdog.companyId,
+    issueId: watchdog.issueId,
+    watchdogAgentId: watchdog.watchdogAgentId,
+    instructions: normalizeInstructions(watchdog.instructions),
+  });
+  return `task_watchdog_config:${createHash("sha256").update(payload).digest("hex")}`;
 }
 
 export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput): TaskWatchdogClassifierResult {
@@ -401,6 +425,8 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   const stopFingerprint = stableStopFingerprint({
     companyId: input.watchdog.companyId,
     watchedIssueId: input.watchdog.issueId,
+    watchdogAgentId: input.watchdog.watchdogAgentId,
+    instructions: input.watchdog.instructions,
     leaves,
   });
 
@@ -570,13 +596,11 @@ function watchdogWakeContext(input: {
           "transition_watched_subtree_issue_status",
           "reassign_watched_subtree_issues",
           "create_child_issues_under_non_watchdog_watched_subtree",
-          "create_product_bug_followups_outside_watched_subtree",
           "resolve_eligible_request_confirmation_plan_interactions",
           "update_reusable_watchdog_issue",
         ],
         deniedOperations: [
           "create_visible_probe_issues_or_throwaway_tasks",
-          "create_product_bug_followups_as_source_tree_children",
           "mutate_task_watchdog_descendants",
           "mutate_outside_watched_subtree",
           "resolve_board_only_or_security_sensitive_approvals",
@@ -1171,6 +1195,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     watchdog: IssueWatchdogRow;
     sourceIssue: IssueRow;
     classification: Extract<TaskWatchdogClassifierResult, { state: "stopped" }>;
+    configurationChanged: boolean;
     runId?: string | null;
   }) {
     const existing = input.watchdog.watchdogIssueId
@@ -1189,7 +1214,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     if (fallback) {
       const shouldReopen = isTerminalIssueStatus(fallback.status) ||
         fallback.status === "backlog" ||
-        await watchdogIssueNeedsFreshWake(fallback);
+        await watchdogIssueNeedsFreshWake(fallback) ||
+        input.configurationChanged;
       const watchdogIssue = shouldReopen
         ? await issuesSvc.update(fallback.id, {
           status: "todo",
@@ -1299,17 +1325,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       watchdog.companyId,
       sourceIssue.id,
     ))?.id ?? null;
-    if (existingWatchdogIssueId && await hasLivePathForIssue(watchdog.companyId, existingWatchdogIssueId)) {
-      await db
-        .update(issueWatchdogs)
-        .set({
-          watchdogIssueId: existingWatchdogIssueId,
-          lastObservedFingerprint: classification.stopFingerprint,
-          updatedAt: new Date(),
-        })
-        .where(eq(issueWatchdogs.id, watchdog.id));
-      return { state: "watchdog_live" as const, classification, watchdogIssueId: existingWatchdogIssueId };
-    }
     const existingWatchdogIssue = existingWatchdogIssueId
       ? await db
         .select()
@@ -1321,6 +1336,43 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ))
         .then((rows) => rows[0] ?? null)
       : null;
+    const currentConfigurationFingerprint = stableWatchdogConfigurationFingerprint(watchdog);
+    const previousConfigurationFingerprint = existingWatchdogIssueId
+      ? await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, watchdog.companyId),
+          eq(activityLog.action, "issue.task_watchdog_triggered"),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, watchdog.issueId),
+          sql`${activityLog.details}->>'watchdogId' = ${watchdog.id}`,
+        ))
+        .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+        .limit(1)
+        .then((rows) => readNonEmptyString(parseObject(rows[0]?.details).watchdogConfigurationFingerprint))
+      : null;
+    const configurationChanged = Boolean(
+      existingWatchdogIssue && (
+        existingWatchdogIssue.assigneeAgentId !== watchdog.watchdogAgentId ||
+        previousConfigurationFingerprint !== currentConfigurationFingerprint
+      ),
+    );
+    if (
+      existingWatchdogIssueId &&
+      !configurationChanged &&
+      await hasLivePathForIssue(watchdog.companyId, existingWatchdogIssueId)
+    ) {
+      await db
+        .update(issueWatchdogs)
+        .set({
+          watchdogIssueId: existingWatchdogIssueId,
+          lastObservedFingerprint: classification.stopFingerprint,
+          updatedAt: new Date(),
+        })
+        .where(eq(issueWatchdogs.id, watchdog.id));
+      return { state: "watchdog_live" as const, classification, watchdogIssueId: existingWatchdogIssueId };
+    }
     if (await sameFingerprintWatchdogReviewIsStillOpen(existingWatchdogIssue, classification.stopFingerprint)) {
       if (
         watchdog.watchdogIssueId !== existingWatchdogIssue!.id ||
@@ -1346,6 +1398,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       watchdog,
       sourceIssue,
       classification,
+      configurationChanged,
       runId: opts.runId ?? null,
     });
     const now = new Date();
@@ -1374,6 +1427,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         watchdogId: watchdog.id,
         watchdogIssueId: watchdogIssue.id,
         stopFingerprint: classification.stopFingerprint,
+        watchdogConfigurationFingerprint: currentConfigurationFingerprint,
         stoppedLeaves: classification.stoppedLeaves,
       },
     });

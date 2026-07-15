@@ -4,6 +4,7 @@ import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  buildDeliveryControlRecoveryWakeIdempotencyKey,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
 } from "@paperclipai/shared";
@@ -260,8 +261,8 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
 // than escalating it as stranded.
 const CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE = "issue_continuation_waiting_on_review";
 
-const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
-const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
+const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 2;
+const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 2;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 
 type ContinuationRetryClassification = {
@@ -626,6 +627,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .limit(10);
 
     let consecutive = 0;
+    let sameCauseConsecutive = 0;
+    let sameCauseOpen = true;
+    let persistedAttempt = 0;
     let latestFinishedAt: Date | null = null;
     for (const row of rows) {
       const ctx = parseObject(row.contextSnapshot);
@@ -639,15 +643,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         break;
       }
 
-      const rowErrorCode = readNonEmptyString(row.errorCode);
-      if (errorCodeToMatch !== rowErrorCode) {
-        break;
-      }
-
       consecutive += 1;
+      persistedAttempt = Math.max(
+        persistedAttempt,
+        Math.max(0, Math.floor(asNumber(ctx.deliveryControlRecoveryAttempt, 0))),
+      );
+      const rowErrorCode = readNonEmptyString(row.errorCode);
+      if (sameCauseOpen && errorCodeToMatch === rowErrorCode) sameCauseConsecutive += 1;
+      else sameCauseOpen = false;
       if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
     }
-    return { consecutive, latestFinishedAt };
+    return {
+      consecutive: Math.max(consecutive, persistedAttempt),
+      sameCauseConsecutive,
+      latestFinishedAt,
+    };
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
@@ -855,6 +865,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function enqueueStrandedIssueRecovery(input: {
+    companyId: string;
     issueId: string;
     agentId: string;
     reason: "issue_assignment_recovery" | "issue_continuation_needed" | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON;
@@ -863,12 +874,35 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
   }) {
+    const sourceRunContext = input.retryOfRunId
+      ? await db
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, input.companyId),
+            eq(heartbeatRuns.id, input.retryOfRunId),
+          ))
+          .limit(1)
+          .then((rows) => parseObject(rows[0]?.contextSnapshot))
+      : {};
+    const deliveryRecoveryAttempt = Math.max(
+      1,
+      Math.floor(asNumber(sourceRunContext.deliveryControlRecoveryAttempt, 0)) + 1,
+    );
+    const idempotencyKey = buildDeliveryControlRecoveryWakeIdempotencyKey({
+      issueId: input.issueId,
+      reason: input.reason,
+      sourceRunId: input.retryOfRunId,
+      attempt: deliveryRecoveryAttempt,
+    });
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
+      idempotencyKey,
       payload: withRecoveryModelProfileHint({
         issueId: input.issueId,
+        deliveryControlRecoveryAttempt: deliveryRecoveryAttempt,
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
@@ -880,6 +914,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         wakeReason: input.reason,
         retryReason: input.retryReason,
         source: input.source,
+        deliveryControlRecoveryAttempt: deliveryRecoveryAttempt,
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
@@ -3117,6 +3152,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             acceptedInteractionResolvedAt,
           );
           const queued = await enqueueStrandedIssueRecovery({
+            companyId: issue.companyId,
             issueId: issue.id,
             agentId,
             reason: "issue_continuation_needed",
@@ -3222,6 +3258,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         const queued = await enqueueStrandedIssueRecovery({
+          companyId: issue.companyId,
           issueId: issue.id,
           agentId: participantAgentId,
           reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
@@ -3297,6 +3334,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         const queued = await enqueueStrandedIssueRecovery({
+          companyId: issue.companyId,
           issueId: issue.id,
           agentId,
           reason: "issue_assignment_recovery",
@@ -3385,6 +3423,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         const queued = await enqueueStrandedIssueRecovery({
+          companyId: issue.companyId,
           issueId: issue.id,
           agentId,
           reason: "issue_continuation_needed",
@@ -3433,7 +3472,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
-          const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
+          const { consecutive, sameCauseConsecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
             issue.companyId,
             issue.id,
             classification.errorCode,
@@ -3465,7 +3504,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           if (classification.baseBackoffMs > 0 && latestFinishedAt) {
             const elapsed = Date.now() - latestFinishedAt.getTime();
             const requiredDelay = classification.baseBackoffMs *
-              Math.pow(2, Math.max(0, consecutive - 1));
+              Math.pow(2, Math.max(0, sameCauseConsecutive - 1));
             if (elapsed < requiredDelay) {
               result.skipped += 1;
               continue;
@@ -3480,6 +3519,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const queued = await enqueueStrandedIssueRecovery({
+        companyId: issue.companyId,
         issueId: issue.id,
         agentId,
         reason: "issue_continuation_needed",

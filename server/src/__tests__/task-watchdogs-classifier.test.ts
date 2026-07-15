@@ -93,6 +93,36 @@ describe("task watchdog subtree classifier", () => {
     });
   });
 
+  it("requires a fresh review when watchdog agent or instructions change", () => {
+    const stopped = classify({
+      watchdog: {
+        companyId,
+        issueId: sourceId,
+        watchdogAgentId: "watchdog-agent-1",
+        instructions: "Check the blocker path.",
+        lastReviewedFingerprint: null,
+      },
+      issues: [issue({ status: "blocked" })],
+    });
+    expect(stopped.state).toBe("stopped");
+    if (stopped.state !== "stopped") return;
+
+    const changed = classify({
+      watchdog: {
+        companyId,
+        issueId: sourceId,
+        watchdogAgentId: "watchdog-agent-2",
+        instructions: "Check the blocker path and the next owner.",
+        lastReviewedFingerprint: stopped.stopFingerprint,
+      },
+      issues: [issue({ status: "blocked" })],
+    });
+
+    expect(changed.state).toBe("stopped");
+    if (changed.state !== "stopped") return;
+    expect(changed.stopFingerprint).not.toBe(stopped.stopFingerprint);
+  });
+
   it("excludes task-watchdog issues and their descendants from watched subtree scans", () => {
     const result = classify({
       issues: [

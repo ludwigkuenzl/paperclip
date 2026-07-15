@@ -2116,3 +2116,21 @@ export {
   type IssueLifecycleContractState,
   type IssueLifecycleContractField,
 } from "./issue-lifecycle-contract.js";
+export {
+  DELIVERY_CONTROL_CONTRACT_V1,
+  analyzeDeliveryCriticalPaths,
+  buildDeliveryControlRecoveryWakeIdempotencyKey,
+  deliveryControlPolicyForPriority,
+  evaluateDeliveryIncidentLane,
+  higherIssuePriority,
+  isDeliveryControlPriority,
+  type DeliveryControlCommunicationReason,
+  type DeliveryControlContractV1,
+  type DeliveryControlCriticalPath,
+  type DeliveryControlCriticalPathAnalysis,
+  type DeliveryControlCriticalPathNode,
+  type DeliveryControlDependencyEdge,
+  type DeliveryControlLivenessState,
+  type DeliveryControlMode,
+  type DeliveryControlPriority,
+} from "./delivery-control-contract.js";

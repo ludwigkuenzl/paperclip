@@ -1611,12 +1611,11 @@ async function watchdogMapForIssues(dbOrTx: any, rows: IssueRow[]): Promise<Map<
 }
 
 const ACTIVE_RUN_STATUSES = ["queued", "running"];
-const BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES = ["queued", "running"];
+const BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution"];
 const BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES = ["pending"];
 const BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES = ["pending", "revision_requested"];
 const BLOCKER_ATTENTION_OPEN_RECOVERY_ORIGIN_KIND = "harness_liveness_escalation";
-const BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ORIGIN_KIND = "issue_productivity_review";
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
@@ -2113,43 +2112,13 @@ async function listIssueBlockerAttentionMap(
             ne(issues.status, "done"),
           ),
         );
-      const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
-        .select({
-          issueId: issues.parentId,
-          blockerIssueId: issues.id,
-          id: issues.id,
-          companyId: issues.companyId,
-          parentId: issues.parentId,
-          identifier: issues.identifier,
-          title: issues.title,
-          status: issues.status,
-          executionRunId: issues.executionRunId,
-          assigneeAgentId: issues.assigneeAgentId,
-          assigneeUserId: issues.assigneeUserId,
-        })
-        .from(issues)
-        .where(
-          and(
-            eq(issues.companyId, companyId),
-            inArray(issues.parentId, chunk),
-            notInArray(issues.status, BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES),
-          ),
-        );
-      const [explicitBlockerRows, childRows] = await Promise.all([
-        explicitBlockerRowsPromise,
-        childRowsPromise,
-      ]);
+      const explicitBlockerRows = await explicitBlockerRowsPromise;
 
-      appendBlockerAttentionEdges(edgesByIssueId, [
-        ...explicitBlockerRows
-          .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
-          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
-        ...childRows
-          .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
-          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
-      ]);
+      appendBlockerAttentionEdges(edgesByIssueId, explicitBlockerRows
+        .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
+        .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })));
 
-      for (const row of [...explicitBlockerRows, ...childRows]) {
+      for (const row of explicitBlockerRows) {
         if (!row.issueId || nodesById.has(row.blockerIssueId)) continue;
         nodesById.set(row.blockerIssueId, {
           id: row.blockerIssueId,
@@ -2425,9 +2394,7 @@ async function listIssueBlockerAttentionMap(
       reason = "stalled_review";
     } else {
       state = "covered";
-      reason = topLevelEdges.every((edge) => nodesById.get(edge.blockerIssueId)?.parentId === root.id)
-        ? "active_child"
-        : "active_dependency";
+      reason = "active_dependency";
     }
 
     attentionMap.set(root.id, createIssueBlockerAttention({

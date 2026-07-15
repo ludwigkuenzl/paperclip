@@ -205,6 +205,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { recoveryService } from "./recovery/service.js";
+import { reconcileDeliveryControlShadow } from "./delivery-control-shadow.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
@@ -11140,6 +11141,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  async function reconcilePriorityDeliveryControl(opts?: { companyId?: string | null; now?: Date; limit?: number }) {
+    return reconcileDeliveryControlShadow(db, opts);
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -16528,6 +16533,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
     reconcileIssueGraphLiveness,
+
+    reconcilePriorityDeliveryControl,
 
     scanSilentActiveRuns,
 

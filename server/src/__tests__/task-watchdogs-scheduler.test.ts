@@ -186,13 +186,12 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
           operations: expect.arrayContaining([
             "comment_on_watched_subtree_issues",
             "create_child_issues_under_non_watchdog_watched_subtree",
-            "create_product_bug_followups_outside_watched_subtree",
             "update_reusable_watchdog_issue",
           ]),
           deniedOperations: expect.arrayContaining([
             "create_visible_probe_issues_or_throwaway_tasks",
-            "create_product_bug_followups_as_source_tree_children",
             "mutate_task_watchdog_descendants",
+            "mutate_outside_watched_subtree",
           ]),
         },
       },
@@ -246,6 +245,57 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
     expect(watchdog?.lastObservedFingerprint).toBe(firstWatchdog?.lastObservedFingerprint);
     expect(watchdog?.triggerCount).toBe(1);
+  });
+
+  it("reopens and reassigns a live reusable review when watchdog configuration changes", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-RECONFIG", status: "done" });
+    const firstAgentId = await seedAgent(companyId, { name: "Original Watchdog" });
+    const nextAgentId = await seedAgent(companyId, { name: "Replacement Watchdog" });
+    const watchdog = await seedWatchdog(companyId, sourceId, firstAgentId);
+    const { service, wakes } = createService();
+
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1 });
+    const [initialReview] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "task_watchdog")));
+    const initialFingerprint = initialReview!.originFingerprint;
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: firstAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId: initialReview!.id, taskId: initialReview!.id },
+      startedAt: new Date(),
+    });
+    await db
+      .update(issueWatchdogs)
+      .set({
+        instructions: "Re-check the stopped work with the replacement policy.",
+      })
+      .where(eq(issueWatchdogs.id, watchdog!.id));
+
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1, live: 0 });
+    expect(wakes).toHaveLength(2);
+    expect(wakes[1]?.agentId).toBe(firstAgentId);
+    const [instructionsReview] = await db.select().from(issues).where(eq(issues.id, initialReview!.id));
+    expect(instructionsReview).toMatchObject({ status: "todo", assigneeAgentId: firstAgentId });
+    expect(instructionsReview?.originFingerprint).not.toBe(initialFingerprint);
+
+    await db
+      .update(issueWatchdogs)
+      .set({ watchdogAgentId: nextAgentId })
+      .where(eq(issueWatchdogs.id, watchdog!.id));
+
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1, live: 0 });
+    expect(wakes).toHaveLength(3);
+    expect(wakes[2]?.agentId).toBe(nextAgentId);
+    const [reassignedReview] = await db.select().from(issues).where(eq(issues.id, initialReview!.id));
+    expect(reassignedReview).toMatchObject({ status: "todo", assigneeAgentId: nextAgentId });
+    expect(reassignedReview?.originFingerprint).not.toBe(instructionsReview?.originFingerprint);
   });
 
   it("re-wakes a same-fingerprint watchdog review stuck in stale in_review", async () => {

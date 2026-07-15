@@ -316,8 +316,8 @@ If useful deliverable work can continue without the external result, the agent s
 Recovery from an invalid external wait is bounded and idempotent:
 
 1. Record bounded evidence that the completed heartbeat left no durable action path, including the terminal run and any reported local watcher metadata without treating that metadata as liveness.
-2. Queue at most one normal-model continuation for the same source state and recovery fingerprint so the assignee can inspect the external result, replace the watcher with a durable wait, continue productive work, or choose a valid disposition.
-3. If that continuation also exits without creating a durable path, do not queue another equivalent continuation. Move the issue to `blocked` only when a real external dependency can be named; otherwise open or update an explicit recovery action with a named owner and concrete repair/escalation action.
+2. Queue at most two normal-model recovery continuations. Each attempt uses a stable issue/reason/source-run/attempt idempotency key so a duplicate scheduler tick cannot create another wake for the same attempt.
+3. If the second attempt exits without creating a durable path, do not queue another equivalent continuation. Move the issue to `blocked` only when a real external dependency can be named; otherwise open or update an explicit recovery action with a named owner and concrete repair/escalation action.
 4. New durable source activity may produce a new recovery fingerprint, but unchanged killed/local-watcher evidence must not create an infinite wake/recovery loop.
 
 This rule is intentionally conservative: local watcher evidence can help the recovery owner decide what happened, but only persisted control-plane state can prove that the work will move again.
@@ -527,8 +527,8 @@ Example:
 
 Recovery rule:
 
-- if the latest issue-linked run failed/timed out/cancelled and no live execution path remains, Paperclip queues one automatic assignment recovery wake
-- if that recovery wake also finishes and the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
+- if the latest issue-linked run failed/timed out/cancelled and no live execution path remains, Paperclip queues a bounded automatic assignment recovery wake
+- after at most two automatic attempts, if the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
 
 This is a dispatch recovery, not a continuation recovery.
 
@@ -543,12 +543,12 @@ Example:
 
 Recovery rule:
 
-- Paperclip queues one automatic continuation wake
-- if that continuation wake also finishes and the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
+- Paperclip queues a bounded automatic continuation wake
+- after at most two automatic attempts, if the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
 
 This is an active-work continuity recovery.
 
-The same bounded rule applies when the previous heartbeat reported waiting on a local/background watcher and that watcher was killed, disappeared, or was never represented by a durable Paperclip primitive. Paperclip queues at most one continuation for the same recovery fingerprint. If the continuation also leaves only local watcher evidence, Paperclip must surface a real blocker or explicit recovery action instead of repeating continuation recovery. A new monitor, scheduled wake, healthy delegated blocker issue, or other durable source mutation resolves that recovery fingerprint normally.
+The same bounded rule applies when the previous heartbeat reported waiting on a local/background watcher and that watcher was killed, disappeared, or was never represented by a durable Paperclip primitive. Paperclip queues at most two attempt-scoped continuations. If the second continuation also leaves only local watcher evidence, Paperclip must surface a real blocker or explicit recovery action instead of repeating continuation recovery. A new monitor, scheduled wake, healthy delegated blocker issue, or other durable source mutation resolves that recovery state normally.
 
 #### Deliberate wait is not a lost run
 
@@ -571,15 +571,39 @@ Automatic retries that can continue source work must use the original/normal mod
 
 Startup recovery and periodic recovery are different from normal wakeup delivery.
 
-On startup and on the periodic recovery loop, Paperclip now does five things in sequence:
+On startup and on the periodic recovery loop, Paperclip uses one ordered chain:
 
 1. reap orphaned `running` runs
-2. resume persisted `queued` runs
-3. reconcile stranded assigned work
-4. scan silent active runs, revalidate their source issues, and either fold source-resolved watchdogs or create/update explicit watchdog recovery actions
-5. reconcile productivity reviews
+2. promote due scheduled retries
+3. resume persisted `queued` runs
+4. reconcile stranded assigned work
+5. reconcile issue-graph liveness
+6. evaluate priority delivery-control SLA/liveness deltas
+7. reconcile task watchdogs
+8. scan silent active runs, revalidate their source issues, and either fold source-resolved watchdogs or create/update explicit watchdog recovery actions
+9. sweep stale issue locks
+10. reconcile productivity reviews
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output. The productivity-review pass is later and separate; it reviews unusual progression patterns on assigned source issues, not stale run handles after a source issue already has a valid disposition.
+
+### Priority delivery control
+
+The priority delivery-control contract id is `paperclip.delivery-control`, version `1.0.0`, and it requires lifecycle contract `paperclip.issue-lifecycle-execution` version `1.0.0` or newer. It applies to `critical` and `high` issues and measures the instruction/unblock trigger, queue entry, run start, progress, and result as separate audit timestamps.
+
+The accepted limits are:
+
+| Priority | Start SLA | Recovery due | Escalation due | Communication maximum gap |
+| --- | ---: | ---: | ---: | ---: |
+| `critical` | 5 minutes | 15 minutes | 30 minutes | 30 minutes |
+| `high` | 15 minutes | 30 minutes | 60 minutes | 2 hours |
+
+Start-SLA risk begins at 80% of the limit. A queued wake counts as covered only before the start deadline and only when queue capacity is available. An active run counts as live only while it has recent progress, owns a coherent issue execution lock, and has no orphaned resource lock. Comments and unmanaged processes remain evidence only. `scheduled_retry`, a future monitor, typed review/approval, a healthy explicit `blocks` dependency path, an explicit recovery action, or a human owner are durable covered paths.
+
+Automatic recovery is capped at two attempt-scoped wakes. Exhaustion requires a first-class blocker/recovery surface. Critical-path propagation follows explicit `blocks` edges only, never `parentId`, and reports dependency depth beyond three or cycles instead of recursing indefinitely. The incident lane admits at most three active technical packages.
+
+Rollout is `off | shadow | enforce`, defaults to `shadow`, and `enforce` is selected only for company ids in `PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS`. The current reconciliation pass is deliberately mutation-free: it writes deduplicated, machine-readable activity observations and fails open per issue. Canary mutation handlers must consume the same evaluation contract before `enforce` can change issue, wake, recovery, or communication state.
+
+User-facing communication is delta-based. A phase change, real blocker, SLA risk, user decision, live acceptance, or long-run progress delta may emit an update only when `completed`, `currentAction`, `remaining`, `owner`, and `nextCheckAt` are present. A stable issue/reason/delta key suppresses duplicates; elapsed time without a state or progress delta does not produce a heartbeat message.
 
 ## 11. Task Watchdog for Issue Trees
 
@@ -770,7 +794,7 @@ Paperclip still does not:
 The recovery model is intentionally conservative:
 
 - preserve ownership
-- retry once when the control plane lost execution continuity
+- retry at most twice when the control plane lost execution continuity
 - open an explicit recovery action when the system can identify a bounded recovery owner/action
 - escalate visibly when the system cannot safely keep going
 
