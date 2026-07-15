@@ -475,6 +475,47 @@ describeEmbeddedPostgres("delivery-control shadow reconciliation", () => {
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
   });
 
+  it("does not enqueue a duplicate escalation run when the assignee is already the CEO", async () => {
+    const { companyId, agentId } = await seedCriticalIssue();
+    await db
+      .update(agents)
+      .set({ name: "CEO", role: "ceo" })
+      .where(eq(agents.id, agentId));
+    process.env.PAPERCLIP_DELIVERY_CONTROL_MODE = "enforce";
+    process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS = companyId;
+    const wakes: Array<{ agentId: string; reason: string }> = [];
+
+    const result = await reconcileDeliveryControlShadow(
+      db,
+      { companyId, now: new Date("2026-07-15T00:31:00.000Z") },
+      {
+        enqueueWakeup: async (wakeAgentId, options) => {
+          wakes.push({ agentId: wakeAgentId, reason: options.reason });
+          const runId = randomUUID();
+          await db.insert(heartbeatRuns).values({
+            id: runId,
+            companyId,
+            agentId: wakeAgentId,
+            invocationSource: "automation",
+            triggerDetail: "system",
+            status: "queued",
+            createdAt: new Date("2026-07-15T00:31:00.000Z"),
+            updatedAt: new Date("2026-07-15T00:31:00.000Z"),
+          });
+          return { id: runId };
+        },
+      },
+    );
+
+    expect(result).toMatchObject({ recoveriesEnqueued: 1, escalationsCreated: 1, failed: 0 });
+    expect(wakes).toEqual([{ agentId, reason: "issue_assignment_recovery" }]);
+    const [escalation] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.delivery_control_ceo_escalated"));
+    expect(escalation?.details).toMatchObject({ coalescedWithAssigneeRecovery: true });
+  });
+
   it("enqueues at most two recovery wakes, escalates the CEO once, then creates a blocker", async () => {
     const { companyId, agentId, issueId } = await seedCriticalIssue();
     const ceoId = randomUUID();

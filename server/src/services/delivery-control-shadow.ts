@@ -1033,7 +1033,8 @@ async function ensureCeoEscalation(
   });
   if (!reservation.needed) return false;
   let escalationRunId: string | null = null;
-  if (ceo) {
+  const coalescedWithAssigneeRecovery = Boolean(ceo && ceo.id === issue.assigneeAgentId);
+  if (ceo && !coalescedWithAssigneeRecovery) {
     const queued = await deps.enqueueWakeup(ceo.id, {
       source: "automation",
       triggerDetail: "system",
@@ -1073,6 +1074,7 @@ async function ensureCeoEscalation(
       ownerAgentId: ceo?.id ?? null,
       recoveryActionId: reservation.recoveryActionId,
       escalationDueAt: state.evaluation.escalation.dueAt,
+      coalescedWithAssigneeRecovery,
     },
   });
 }
