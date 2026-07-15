@@ -3035,6 +3035,52 @@ function allowsIssueInteractionWake(
   return Boolean(deriveCommentId(contextSnapshot, null));
 }
 
+const DELIVERY_CONTROL_RECOVERY_WAKE_REASON = "issue_assignment_recovery";
+const DELIVERY_CONTROL_RECOVERY_CAUSE = "delivery_control_liveness";
+const DELIVERY_CONTROL_RECOVERY_SOURCE = "delivery_control.reconcile";
+
+async function isVerifiedDeliveryControlDependencyRecoveryWake(
+  dbOrTx: Pick<Db, "select">,
+  input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    contextSnapshot: Record<string, unknown> | null | undefined;
+    now?: Date;
+  },
+) {
+  const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
+  const retryReason = readNonEmptyString(input.contextSnapshot?.retryReason);
+  const source = readNonEmptyString(input.contextSnapshot?.source);
+  const recoveryActionId = readNonEmptyString(input.contextSnapshot?.recoveryActionId);
+  if (
+    wakeReason !== DELIVERY_CONTROL_RECOVERY_WAKE_REASON ||
+    retryReason !== DELIVERY_CONTROL_RECOVERY_CAUSE ||
+    source !== DELIVERY_CONTROL_RECOVERY_SOURCE ||
+    !recoveryActionId
+  ) {
+    return false;
+  }
+
+  const now = input.now ?? new Date();
+  const action = await dbOrTx
+    .select({ id: issueRecoveryActions.id })
+    .from(issueRecoveryActions)
+    .where(and(
+      eq(issueRecoveryActions.id, recoveryActionId),
+      eq(issueRecoveryActions.companyId, input.companyId),
+      eq(issueRecoveryActions.sourceIssueId, input.issueId),
+      eq(issueRecoveryActions.ownerType, "agent"),
+      eq(issueRecoveryActions.ownerAgentId, input.agentId),
+      eq(issueRecoveryActions.cause, DELIVERY_CONTROL_RECOVERY_CAUSE),
+      inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      or(isNull(issueRecoveryActions.timeoutAt), gt(issueRecoveryActions.timeoutAt, now)),
+    ))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  return Boolean(action);
+}
+
 async function listUnresolvedBlockerSummaries(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -10307,6 +10353,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const issueId = readNonEmptyString(context.issueId);
+    let verifiedDependencyRecoveryWake = false;
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(run.companyId, issueId);
       const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(db, {
@@ -10342,7 +10389,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
-      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
+      verifiedDependencyRecoveryWake = unresolvedBlockerCount > 0 && await isVerifiedDeliveryControlDependencyRecoveryWake(
+        db,
+        {
+          companyId: run.companyId,
+          issueId,
+          agentId: run.agentId,
+          contextSnapshot: context,
+        },
+      );
+      if (
+        unresolvedBlockerCount > 0 &&
+        !allowsIssueInteractionWake(context) &&
+        !verifiedDependencyRecoveryWake
+      ) {
         await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
         logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
         return null;
@@ -10367,7 +10427,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
     const claimedWakeReason = readNonEmptyString(context.wakeReason);
-    const interactionWake = allowsIssueInteractionWake(context);
+    const interactionWake = allowsIssueInteractionWake(context) || verifiedDependencyRecoveryWake;
     let claimed: typeof heartbeatRuns.$inferSelect | null;
     let resourceLeaseDecision: ResourceControlLeaseDecision | null = null;
     try {
@@ -15535,16 +15595,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           tx,
         ).then((rows) => rows.get(issue.id) ?? null);
 
+        const verifiedDependencyRecoveryWake = Boolean(
+          dependencyReadiness &&
+          !dependencyReadiness.isDependencyReady &&
+          await isVerifiedDeliveryControlDependencyRecoveryWake(tx, {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            agentId,
+            contextSnapshot: enrichedContextSnapshot,
+          }),
+        );
+
         // Blocked descendants should stay idle until the final blocker resolves.
         // Human comment/mention wakes are the exception: they may run in a
-        // bounded interaction mode so the assignee can answer or triage.
+        // bounded interaction mode so the assignee can answer or triage. A
+        // delivery-control recovery gets the same bounded mode only when its
+        // persisted recovery action is still active and bound to this exact
+        // company, issue, and assignee.
         const blockedInteractionWake =
           dependencyReadiness &&
           !dependencyReadiness.isDependencyReady &&
-          allowsIssueInteractionWake(enrichedContextSnapshot);
+          (
+            allowsIssueInteractionWake(enrichedContextSnapshot) ||
+            verifiedDependencyRecoveryWake
+          );
 
         if (blockedInteractionWake) {
           enrichedContextSnapshot.dependencyBlockedInteraction = true;
+          if (verifiedDependencyRecoveryWake) {
+            enrichedContextSnapshot.dependencyBlockedRecovery = true;
+          }
           enrichedContextSnapshot.unresolvedBlockerIssueIds = dependencyReadiness.unresolvedBlockerIssueIds;
           enrichedContextSnapshot.unresolvedBlockerCount = dependencyReadiness.unresolvedBlockerCount;
           enrichedContextSnapshot.unresolvedBlockerSummaries = await listUnresolvedBlockerSummaries(

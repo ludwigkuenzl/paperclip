@@ -18,6 +18,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueRecoveryActions,
   issueRelations,
   issueTreeHolds,
   issues,
@@ -131,6 +132,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(companySkills);
     await db.delete(issueComments);
     await db.delete(issueDocuments);
+    await db.delete(issueRecoveryActions);
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issueRelations);
@@ -474,6 +476,81 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${blockedIssueId}`)
       .then((rows) => rows[0]?.count ?? 0);
     expect(blockedRunsBeforeResolution).toBe(0);
+
+    const recoveryActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "issue_graph_liveness",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "delivery_control_liveness",
+      fingerprint: "delivery-control-dependency-recovery",
+      evidence: {},
+      nextAction: "Restore an executable dependency or monitor path.",
+      attemptCount: 1,
+      maxAttempts: 2,
+      timeoutAt: new Date(Date.now() + 60_000),
+      lastAttemptAt: new Date(),
+    });
+
+    const forgedRecoveryWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assignment_recovery",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        wakeReason: "issue_assignment_recovery",
+        retryReason: "delivery_control_liveness",
+        source: "delivery_control.reconcile",
+        recoveryActionId: randomUUID(),
+      },
+    });
+    expect(forgedRecoveryWake).toBeNull();
+
+    const recoveryWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assignment_recovery",
+      payload: { issueId: blockedIssueId, recoveryActionId },
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        wakeReason: "issue_assignment_recovery",
+        retryReason: "delivery_control_liveness",
+        source: "delivery_control.reconcile",
+        recoveryActionId,
+      },
+    });
+    expect(recoveryWake).not.toBeNull();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, recoveryWake!.id))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const recoveryRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, recoveryWake!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryRun?.status).toBe("succeeded");
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      dependencyBlockedInteraction: true,
+      dependencyBlockedRecovery: true,
+      unresolvedBlockerIssueIds: [blockerId],
+    });
 
     const interactionWake = await heartbeat.wakeup(agentId, {
       source: "automation",
