@@ -324,6 +324,47 @@ describe("buildAssistantPartsFromTranscript", () => {
 });
 
 describe("buildIssueChatMessages", () => {
+  it("represents queued work as a distinct waiting message, never running or finished", () => {
+    const messages = buildIssueChatMessages({
+      comments: [],
+      timelineEvents: [],
+      linkedRuns: [],
+      liveRuns: [
+        {
+          id: "run-queued",
+          status: "queued",
+          invocationSource: "assignment",
+          triggerDetail: null,
+          startedAt: null,
+          finishedAt: null,
+          createdAt: "2026-07-15T10:00:00.000Z",
+          agentId: "agent-1",
+          agentName: "CodexCoder",
+          adapterType: "codex_local",
+        },
+      ],
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      id: "run-assistant:run-queued",
+      role: "assistant",
+      status: { type: "complete", reason: "unknown" },
+      metadata: {
+        custom: {
+          kind: "queued-run",
+          runStatus: "queued",
+          waitingText: "Waiting to start…",
+        },
+      },
+    });
+    expect(JSON.stringify(messages[0])).not.toContain("Run finished");
+    const queuedMessage = messages[0];
+    expect(queuedMessage?.role).toBe("assistant");
+    if (queuedMessage?.role !== "assistant") throw new Error("Expected an assistant message");
+    expect(queuedMessage.status.type).not.toBe("running");
+  });
+
   it("uses the company user label for current-user comments instead of collapsing to You", () => {
     const messages = buildIssueChatMessages({
       comments: [createComment({ authorUserId: "user-1" })],

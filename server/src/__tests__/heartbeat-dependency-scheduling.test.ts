@@ -1160,6 +1160,27 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         return run?.status === "running";
       });
       expect(firstStarted).toBe(true);
+      const firstAdapterStarted = await waitForCondition(async () => mockAdapterExecute.mock.calls.some(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === firstRunId,
+      ));
+      expect(firstAdapterStarted).toBe(true);
+      const firstAdapterContext = mockAdapterExecute.mock.calls.find(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === firstRunId,
+      )?.[0] as {
+        context?: { paperclipResourceControl?: Record<string, unknown> };
+        config?: { env?: Record<string, string> };
+      } | undefined;
+      expect(firstAdapterContext?.context?.paperclipResourceControl).toMatchObject({
+        actionClass: "deploy",
+        resourceKey: "deploy:production",
+        changeId: "sha-first",
+        fencingToken: 1,
+      });
+      expect(firstAdapterContext?.config?.env).toMatchObject({
+        PAPERCLIP_RESOURCE_KEY: "deploy:production",
+        PAPERCLIP_RESOURCE_CHANGE_ID: "sha-first",
+        PAPERCLIP_RESOURCE_FENCING_TOKEN: "1",
+      });
       const [waiting] = await db
         .select({ status: heartbeatRuns.status })
         .from(heartbeatRuns)
@@ -1263,6 +1284,158 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
     )).toHaveLength(0);
   });
+
+  it("fails closed for inferred shared writes only inside the resource-control company canary", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const previousMode = process.env.PAPERCLIP_RESOURCE_CONTROL_MODE;
+    const previousCompanies = process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS;
+    process.env.PAPERCLIP_RESOURCE_CONTROL_MODE = "enforce";
+    process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS = companyId;
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Shared Write Canary",
+        issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "SharedWriter",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Unscoped shared mutation",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+
+      await heartbeat.resumeQueuedRuns();
+      const denied = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        return run?.status === "cancelled" && run.errorCode === "resource_control_denied";
+      });
+      expect(denied).toBe(true);
+      expect(mockAdapterExecute.mock.calls.filter(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
+      )).toHaveLength(0);
+    } finally {
+      if (previousMode === undefined) delete process.env.PAPERCLIP_RESOURCE_CONTROL_MODE;
+      else process.env.PAPERCLIP_RESOURCE_CONTROL_MODE = previousMode;
+      if (previousCompanies === undefined) delete process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS;
+      else process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS = previousCompanies;
+    }
+  });
+
+  it("does not let delivery-control enforcement activate inferred resource-control denial", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const previousDeliveryMode = process.env.PAPERCLIP_DELIVERY_CONTROL_MODE;
+    const previousDeliveryCompanies = process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS;
+    const previousResourceMode = process.env.PAPERCLIP_RESOURCE_CONTROL_MODE;
+    const previousResourceCompanies = process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS;
+    process.env.PAPERCLIP_DELIVERY_CONTROL_MODE = "enforce";
+    process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS = companyId;
+    process.env.PAPERCLIP_RESOURCE_CONTROL_MODE = "shadow";
+    process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS = companyId;
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Independent Delivery Canary",
+        issuePrefix: `I${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "IndependentWriter",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Existing inferred shared work",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: runId,
+        body: "Existing shared work completed without resource-control opt-in.",
+      });
+
+      await heartbeat.resumeQueuedRuns();
+      const succeeded = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        return run?.status === "succeeded" && run.errorCode == null;
+      }, 10_000);
+      expect(succeeded).toBe(true);
+      expect(mockAdapterExecute.mock.calls.some(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
+      )).toBe(true);
+    } finally {
+      if (previousDeliveryMode === undefined) delete process.env.PAPERCLIP_DELIVERY_CONTROL_MODE;
+      else process.env.PAPERCLIP_DELIVERY_CONTROL_MODE = previousDeliveryMode;
+      if (previousDeliveryCompanies === undefined) delete process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS;
+      else process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS = previousDeliveryCompanies;
+      if (previousResourceMode === undefined) delete process.env.PAPERCLIP_RESOURCE_CONTROL_MODE;
+      else process.env.PAPERCLIP_RESOURCE_CONTROL_MODE = previousResourceMode;
+      if (previousResourceCompanies === undefined) delete process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS;
+      else process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS = previousResourceCompanies;
+    }
+  }, 20_000);
 
   it("cancels stale queued runs when issue blockers are still unresolved", async () => {
     const companyId = randomUUID();

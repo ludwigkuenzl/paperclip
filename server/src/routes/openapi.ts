@@ -3436,6 +3436,24 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/heartbeat-runs/{runId}/resource-control-recovery",
+  tags: ["runs"],
+  summary: "Resolve a resource lease after target-state readback",
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: jsonBody(z.object({
+      disposition: z.enum(["completed", "not_applied"]),
+      observedChangeId: z.string().nullable(),
+      observedFencingToken: z.number().int().positive().nullable(),
+      readback: z.record(z.string(), z.unknown()),
+      reason: z.string().min(1),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/heartbeat-runs/{runId}/watchdog-decisions",
   tags: ["runs"],
   summary: "Submit watchdog decisions for a run",

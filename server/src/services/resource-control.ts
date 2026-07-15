@@ -8,6 +8,37 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionWorkspaceSettings } from "./execution-workspace-policy.js";
 
+export const RESOURCE_CONTROL_MODE_ENV = "PAPERCLIP_RESOURCE_CONTROL_MODE";
+export const RESOURCE_CONTROL_COMPANY_IDS_ENV = "PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS";
+export type ResourceControlMode = "off" | "shadow" | "enforce";
+
+export function resolveResourceControlMode(value: string | null | undefined): ResourceControlMode {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "off" || normalized === "enforce") return normalized;
+  return "shadow";
+}
+
+export function readResourceControlConfig(
+  companyId: string,
+  input: { mode?: string | null; canaryCompanyIds?: string | null } = {},
+) {
+  const configuredMode = resolveResourceControlMode(
+    input.mode === undefined ? process.env[RESOURCE_CONTROL_MODE_ENV] : input.mode,
+  );
+  const canaryCompanyIds = (
+    input.canaryCompanyIds === undefined
+      ? process.env[RESOURCE_CONTROL_COMPANY_IDS_ENV]
+      : input.canaryCompanyIds
+  )
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean) ?? [];
+  const effectiveMode: ResourceControlMode = configuredMode === "enforce"
+    ? canaryCompanyIds.includes(companyId) ? "enforce" : "shadow"
+    : configuredMode;
+  return { companyId, configuredMode, effectiveMode, canaryCompanyIds } as const;
+}
+
 export interface ResourceControlledIssueInput {
   id: string;
   companyId: string;
@@ -28,6 +59,25 @@ export interface ResolvedIssueResourceControl {
   leaseRequired: boolean;
   productiveParallelismAllowed: boolean;
   blockedReason: string | null;
+}
+
+export function resolveResourceControlClaimGate(
+  resourceControl: ResolvedIssueResourceControl,
+  resourceControlMode: ResourceControlMode,
+) {
+  if (!resourceControl.leaseRequired) {
+    return { enforced: false, blockedReason: null } as const;
+  }
+  // Explicit resource-control metadata already opted this issue into the
+  // durable lease protocol. Only inferred exclusive work is rollout-gated;
+  // shadow/off must not introduce new global execution denial.
+  if (resourceControl.source === "inferred" && resourceControlMode !== "enforce") {
+    return { enforced: false, blockedReason: null } as const;
+  }
+  return {
+    enforced: true,
+    blockedReason: resourceControl.blockedReason,
+  } as const;
 }
 
 function inferredActionClass(input: ResourceControlledIssueInput): DeliveryControlActionClass {

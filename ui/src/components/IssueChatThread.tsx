@@ -170,7 +170,7 @@ import { nextWorkMode, titleForPendingWorkMode, workModeMetaFor, workModeMetaLis
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
-import { AlertTriangle, ArrowRight, Brain, Check, ChevronDown, ClipboardList, Copy, Hammer, Loader2, MoreHorizontal, Paperclip, PauseCircle, Search, Square, ThumbsDown, ThumbsUp, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowRight, Brain, Check, ChevronDown, ClipboardList, Clock, Copy, Hammer, Loader2, MoreHorizontal, Paperclip, PauseCircle, Search, Square, ThumbsDown, ThumbsUp, Trash2 } from "lucide-react";
 import { IssueBlockedNotice } from "./IssueBlockedNotice";
 import { IssueAssignedBacklogNotice } from "./IssueAssignedBacklogNotice";
 import {
@@ -1710,6 +1710,7 @@ function IssueChatAssistantMessage({
   const followUpRequested = custom.followUpRequested === true;
 
   const kind = typeof custom.kind === "string" ? custom.kind : null;
+  const isQueued = kind === "queued-run" || runStatus === "queued";
   const hasCommentText = message.content.some(
     (part) => part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0,
   );
@@ -1939,6 +1940,14 @@ function IssueChatAssistantMessage({
                   <Loader2 className="h-3 w-3 animate-spin" />
                   Running
                 </Badge>
+              ) : isQueued ? (
+                <Badge
+                  variant="outline"
+                  className="gap-1 border-amber-500/50 bg-amber-500/15 text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow) text-amber-700 dark:text-amber-300"
+                >
+                  <Clock className="h-3 w-3" />
+                  Queued
+                </Badge>
               ) : null}
             </div>
           )}
@@ -1954,13 +1963,18 @@ function IssueChatAssistantMessage({
                 {message.content.length === 0 && waitingText ? (
                   <div className="rounded-lg px-1 py-2">
                     <div className="flex min-w-0 items-center gap-2.5">
-                      <span className="inline-flex items-center gap-2 text-sm font-medium text-foreground/80">
-                        {agentIcon ? (
+                      <span className={cn(
+                        "inline-flex items-center gap-2 text-sm font-medium",
+                        isQueued ? "text-amber-700 dark:text-amber-300" : "text-foreground/80",
+                      )}>
+                        {isQueued ? (
+                          <Clock className="h-4 w-4 shrink-0" />
+                        ) : agentIcon ? (
                           <AgentIcon icon={agentIcon} className="h-4 w-4 shrink-0" />
                         ) : (
                           <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
                         )}
-                        <span className="shimmer-text">{waitingText}</span>
+                        <span className={cn(!isQueued && "shimmer-text")}>{waitingText}</span>
                       </span>
                     </div>
                     <IssueChatLiveRunStatusLine custom={custom} active={isRunning} className="pl-6" />

@@ -994,12 +994,7 @@ function createLiveRunMessage(args: {
   const { run, transcript } = args;
   const compactedTranscript = compactIssueChatTranscript(transcript);
   const { parts, notices, segments } = buildAssistantPartsFromTranscript(compactedTranscript);
-  const waitingText =
-    run.status === "queued"
-      ? "Queued..."
-      : parts.length > 0
-        ? ""
-        : "Working...";
+  const waitingText = parts.length > 0 ? "" : "Working...";
 
   const content = parts;
 
@@ -1025,6 +1020,38 @@ function createLiveRunMessage(args: {
       currentToolName: run.currentToolName ?? null,
       lastAssistantSnippet: run.lastAssistantSnippet ?? null,
       lastEventAt: run.lastEventAt ?? null,
+    }),
+  };
+  return message;
+}
+
+function createQueuedRunMessage(args: {
+  run: LiveRunForIssue;
+  transcript: readonly IssueChatTranscriptEntry[];
+}) {
+  const { run, transcript } = args;
+  const compactedTranscript = compactIssueChatTranscript(transcript);
+  const { parts, notices, segments } = buildAssistantPartsFromTranscript(compactedTranscript);
+
+  const message: ThreadAssistantMessage = {
+    id: `run-assistant:${run.id}`,
+    role: "assistant",
+    createdAt: toDate(run.createdAt),
+    content: parts,
+    // assistant-ui has no queued transport status. Keep the transport message
+    // settled and carry the domain status explicitly in central metadata.
+    status: { type: "complete", reason: "unknown" },
+    metadata: createAssistantMetadata({
+      kind: "queued-run",
+      runId: run.id,
+      runAgentId: run.agentId,
+      runAgentName: run.agentName,
+      runStatus: "queued",
+      adapterType: run.adapterType,
+      notices,
+      waitingText: parts.length > 0 ? "" : "Waiting to start…",
+      chainOfThoughtSegments: segments,
+      resourceQueueTelemetry: run.resourceQueueTelemetry ?? null,
     }),
   };
   return message;
@@ -1133,10 +1160,15 @@ export function buildIssueChatMessages(args: {
     orderedMessages.push({
       createdAtMs: toTimestamp(run.startedAt ?? run.createdAt),
       order: 3,
-      message: createLiveRunMessage({
-        run,
-        transcript: transcriptsByRunId?.get(run.id) ?? [],
-      }),
+      message: run.status === "queued"
+        ? createQueuedRunMessage({
+          run,
+          transcript: transcriptsByRunId?.get(run.id) ?? [],
+        })
+        : createLiveRunMessage({
+          run,
+          transcript: transcriptsByRunId?.get(run.id) ?? [],
+        }),
     });
   }
 

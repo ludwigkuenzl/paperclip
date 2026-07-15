@@ -36,6 +36,7 @@ export interface DeliveryControlEvaluationInput {
   hasTypedReviewOrApproval?: boolean;
   hasLiveDependencyPath?: boolean;
   hasExplicitRecoveryAction?: boolean;
+  hasUnscheduledRecoveryAction?: boolean;
   hasHumanOwner?: boolean;
   now?: Date | string;
 }
@@ -216,8 +217,7 @@ export function evaluateDeliveryControl(input: DeliveryControlEvaluationInput): 
     input.hasScheduledMonitor ||
     input.hasTypedReviewOrApproval ||
     input.hasLiveDependencyPath ||
-    input.hasExplicitRecoveryAction ||
-    input.hasHumanOwner
+    input.hasExplicitRecoveryAction
   );
   if (!runStartedAt && (phase === "waiting" || phase === "review") && hasDurableWaitingPath) {
     startSlaStatus = "not_applicable";
@@ -230,6 +230,7 @@ export function evaluateDeliveryControl(input: DeliveryControlEvaluationInput): 
   let livenessState: DeliveryControlLivenessState;
   if (terminal) livenessState = "terminal";
   else if (input.hasOrphanedResourceLock === true) livenessState = "needs_attention";
+  else if (input.hasUnscheduledRecoveryAction === true) livenessState = "needs_attention";
   else if (attemptCount >= maximumAttempts && !activeRunIsFresh) livenessState = "needs_attention";
   else if (activeRunIsFresh) livenessState = "active";
   else if (hasCoveredPath) livenessState = "covered";

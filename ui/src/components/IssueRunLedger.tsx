@@ -20,6 +20,8 @@ import { describeRunRetryState } from "../lib/runRetryState";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
 import { SourceResolvedFoldBadge } from "./SourceResolvedFoldBadge";
 import { ResponsibleUserDenialNotice } from "./ResponsibleUserDenialNotice";
+import { QueueTelemetryDetails, RunQueueWaitBadge } from "./RunQueueWait";
+import { isRunLive, isRunQueued } from "../lib/run-queue-status";
 
 type IssueRunLedgerProps = {
   issueId: string;
@@ -243,6 +245,7 @@ function liveRunToLedgerRun(run: LiveRunForIssue | ActiveRunForIssue): LedgerRun
     resultJson: null,
     isLive: run.status === "queued" || run.status === "running",
     outputSilence: run.outputSilence,
+    resourceQueueTelemetry: run.resourceQueueTelemetry ?? null,
   };
 }
 
@@ -258,7 +261,13 @@ function mergeRuns(
     byId.set(
       run.id,
       existing
-        ? { ...existing, isLive: true, agentName: run.agentName, outputSilence: run.outputSilence }
+        ? {
+            ...existing,
+            isLive: true,
+            agentName: run.agentName,
+            outputSilence: run.outputSilence,
+            resourceQueueTelemetry: run.resourceQueueTelemetry ?? existing.resourceQueueTelemetry ?? null,
+          }
         : liveRunToLedgerRun(run),
     );
   }
@@ -270,6 +279,7 @@ function mergeRuns(
         isLive: isActiveRun(existing) || isActiveRun(activeRun),
         agentName: activeRun.agentName,
         outputSilence: activeRun.outputSilence,
+        resourceQueueTelemetry: activeRun.resourceQueueTelemetry ?? existing.resourceQueueTelemetry ?? null,
       });
     } else {
       byId.set(activeRun.id, liveRunToLedgerRun(activeRun));
@@ -734,11 +744,13 @@ export function IssueRunLedgerContent({
                   <span className="rounded-md border border-border px-1.5 py-0.5 text-(length:--text-micro) capitalize text-muted-foreground">
                     {statusLabel(run.status)}
                   </span>
-                  {run.isLive ? (
+                  {isRunLive(run.status) ? (
                     <span className="inline-flex items-center gap-1 rounded-md border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-(length:--text-micro) text-blue-700 dark:text-blue-300">
                       <span className="h-1.5 w-1.5 rounded-full bg-blue-500" />
                       live
                     </span>
+                  ) : isRunQueued(run.status) ? (
+                    <RunQueueWaitBadge status={run.status} telemetry={run.resourceQueueTelemetry} />
                   ) : null}
                   <span
                     className={cn(
@@ -800,6 +812,10 @@ export function IssueRunLedgerContent({
                   {sourceResolvedFold ? <SourceResolvedFoldBadge /> : null}
                   <span className="ml-auto shrink-0">{relativeTime(item.timestamp)}</span>
                 </div>
+
+                {run.resourceQueueTelemetry ? (
+                  <QueueTelemetryDetails telemetry={run.resourceQueueTelemetry} />
+                ) : null}
 
                 <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
                   <div className="min-w-0">

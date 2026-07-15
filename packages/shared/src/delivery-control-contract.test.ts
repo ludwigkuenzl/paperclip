@@ -38,6 +38,7 @@ describe("delivery-control contract", () => {
         canary: { minimumConcurrentIndependentRunsPerReferenceRole: 3 },
       },
     });
+    expect(DELIVERY_CONTROL_CONTRACT_V1.liveness.coveredRequiresAny).not.toContain("human_owner");
     expect(deliveryControlPolicyForPriority("medium")).toBeNull();
   });
 

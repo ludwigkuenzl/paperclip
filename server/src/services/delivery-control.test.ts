@@ -163,6 +163,30 @@ describe("delivery-control SLA and liveness shadow evaluator", () => {
     expect(orphaned.livenessState).toBe("needs_attention");
   });
 
+  it("does not treat an owner or an unscheduled recovery record as durable coverage", () => {
+    const humanOwned = evaluateDeliveryControl({
+      companyId,
+      issueId,
+      priority: "critical",
+      status: "blocked",
+      triggerAt,
+      hasHumanOwner: true,
+      now: "2026-07-15T00:16:00.000Z",
+    });
+    expect(humanOwned.livenessState).toBe("stalled");
+
+    const unscheduledRecovery = evaluateDeliveryControl({
+      companyId,
+      issueId,
+      priority: "critical",
+      status: "blocked",
+      triggerAt,
+      hasUnscheduledRecoveryAction: true,
+      now: "2026-07-15T00:16:00.000Z",
+    });
+    expect(unscheduledRecovery.livenessState).toBe("needs_attention");
+  });
+
   it("keeps enforce mode canary-scoped and defaults unknown modes to shadow", () => {
     expect(readDeliveryControlConfig(companyId, {
       mode: "enforce",

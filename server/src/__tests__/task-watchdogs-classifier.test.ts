@@ -201,6 +201,22 @@ describe("task watchdog subtree classifier", () => {
     expect(result).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
   });
 
+  it("does not let an old queued run mask a stopped subtree indefinitely", () => {
+    const result = classify({
+      issues: [issue({ status: "in_progress", createdAt: new Date("2026-06-18T16:00:00.000Z") })],
+      activeRuns: [{
+        companyId,
+        issueId: sourceId,
+        agentId: "agent-1",
+        status: "queued",
+        createdAt: new Date("2026-06-18T16:00:00.000Z"),
+      }],
+      evaluatedAt: new Date("2026-06-18T16:11:00.000Z"),
+    });
+
+    expect(result.state).toBe("stopped");
+  });
+
   it("triggers a genuinely idle assigned issue once the grace window has elapsed", () => {
     const createdAt = new Date("2026-06-18T16:32:45.731Z");
     const result = classify({

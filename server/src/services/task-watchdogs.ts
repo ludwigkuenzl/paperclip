@@ -39,6 +39,10 @@ const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed
 // false-positive stopped-subtree review. The periodic watchdog reconciler
 // re-evaluates after the window, so a genuinely idle issue still triggers.
 const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 15_000;
+// A queued row is evidence of scheduling, not proof of indefinite liveness.
+// Beyond two default resource-lease windows the scheduler must either start,
+// reschedule, or expose the subtree as stopped for recovery.
+const TASK_WATCHDOG_QUEUED_PATH_MAX_LIVE_AGE_MS = 10 * 60_000;
 
 type ActorFields = {
   agentId?: string | null;
@@ -82,6 +86,8 @@ export type TaskWatchdogClassifierPath = {
   issueId: string | null;
   agentId?: string | null;
   status: string;
+  createdAt?: Date | string | null;
+  nextCheckAt?: Date | string | null;
 };
 
 export type TaskWatchdogClassifierWaitingPath = {
@@ -251,10 +257,33 @@ function toEpochMs(value: Date | string | null | undefined): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function pathIssueIds(paths: TaskWatchdogClassifierPath[] | undefined, companyId: string) {
+function pathIssueIds(
+  paths: TaskWatchdogClassifierPath[] | undefined,
+  companyId: string,
+  evaluatedAt?: Date | string | null,
+) {
+  const evaluatedAtMs = toEpochMs(evaluatedAt) ?? Date.now();
   return new Set(
     (paths ?? [])
-      .filter((path) => path.companyId === companyId && typeof path.issueId === "string" && path.issueId.length > 0)
+      .filter((path) => {
+        if (path.companyId !== companyId || typeof path.issueId !== "string" || path.issueId.length === 0) {
+          return false;
+        }
+        if (path.status === "running") return true;
+        if (path.status === "scheduled_retry") {
+          const nextCheckAtMs = toEpochMs(path.nextCheckAt);
+          return nextCheckAtMs == null ||
+            nextCheckAtMs >= evaluatedAtMs - TASK_WATCHDOG_QUEUED_PATH_MAX_LIVE_AGE_MS;
+        }
+        if (path.status === "queued" || path.status === "deferred_issue_execution") {
+          const createdAtMs = toEpochMs(path.createdAt);
+          // Preserve compatibility for in-memory classifier callers that do
+          // not provide timestamps. Production collectors always do.
+          return createdAtMs == null ||
+            evaluatedAtMs - createdAtMs <= TASK_WATCHDOG_QUEUED_PATH_MAX_LIVE_AGE_MS;
+        }
+        return true;
+      })
       .map((path) => path.issueId as string),
   );
 }
@@ -345,8 +374,8 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   const includedIds = included.map((issue) => issue.id);
   const includedIdSet = new Set(includedIds);
   const liveIssueIds = [
-    ...pathIssueIds(input.activeRuns, input.watchdog.companyId),
-    ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId),
+    ...pathIssueIds(input.activeRuns, input.watchdog.companyId, input.evaluatedAt),
+    ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId, input.evaluatedAt),
   ].filter((issueId) => includedIdSet.has(issueId));
   const uniqueLiveIssueIds = [...new Set(liveIssueIds)].sort();
   if (uniqueLiveIssueIds.length > 0) {
@@ -841,6 +870,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
           contextSnapshot: heartbeatRuns.contextSnapshot,
+          createdAt: heartbeatRuns.createdAt,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         })
         .from(heartbeatRuns)
         .where(and(
@@ -857,6 +888,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
           issueId: issues.id,
+          createdAt: heartbeatRuns.createdAt,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         })
         .from(issues)
         .innerJoin(heartbeatRuns, eq(issues.executionRunId, heartbeatRuns.id))
@@ -872,6 +905,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           agentId: agentWakeupRequests.agentId,
           status: agentWakeupRequests.status,
           payload: agentWakeupRequests.payload,
+          createdAt: agentWakeupRequests.createdAt,
         })
         .from(agentWakeupRequests)
         .where(and(
@@ -989,12 +1023,22 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromRunContext(row.contextSnapshot),
-      })).concat(activeIssueRunRows),
+        createdAt: row.createdAt,
+        nextCheckAt: row.scheduledRetryAt,
+      })).concat(activeIssueRunRows.map((row) => ({
+        companyId: row.companyId,
+        agentId: row.agentId,
+        status: row.status,
+        issueId: row.issueId,
+        createdAt: row.createdAt,
+        nextCheckAt: row.scheduledRetryAt,
+      }))),
       queuedWakeRequests: wakeRows.map((row) => ({
         companyId: row.companyId,
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromWakePayload(row.payload),
+        createdAt: row.createdAt,
       })),
       blockers: blockerRows,
       pendingInteractions: interactionRows,

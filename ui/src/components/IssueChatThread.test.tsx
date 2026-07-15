@@ -3798,6 +3798,48 @@ describe("IssueChatThread", () => {
     });
   });
 
+  it("renders queued work as a static waiting state instead of running or finished", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <IssueChatThread
+            comments={[]}
+            linkedRuns={[]}
+            timelineEvents={[]}
+            liveRuns={[{
+              id: "run-queued",
+              issueId: "issue-1",
+              status: "queued",
+              invocationSource: "assignment",
+              triggerDetail: null,
+              startedAt: null,
+              finishedAt: null,
+              createdAt: "2026-07-15T10:00:00.000Z",
+              agentId: "agent-1",
+              agentName: "Agent 1",
+              adapterType: "codex_local",
+            }]}
+            onAdd={async () => {}}
+            enableLiveTranscriptPolling={false}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const row = container.querySelector('[data-message-kind="queued-run"]');
+    expect(row).not.toBeNull();
+    expect(row?.textContent).toContain("Queued");
+    expect(row?.textContent).toContain("Waiting to start…");
+    expect(row?.textContent).not.toContain("Running");
+    expect(row?.textContent).not.toContain("Working");
+    expect(row?.textContent).not.toContain("Run finished");
+    expect(row?.querySelector(".animate-spin")).toBeNull();
+
+    act(() => root.unmount());
+  });
+
   it("folds chain-of-thought when the same message transitions from running to complete", () => {
     expect(resolveAssistantMessageFoldedState({
       messageId: "message-1",

@@ -52,19 +52,19 @@ The rollout flag changes only mutation/wake enforcement. The transaction-level i
 
 The machine-readable action-class and lease contract is exported from `packages/shared/src/delivery-control-contract.ts`. It defines `read_only`, `review`, `vault_write`, and `isolated_write` as parallel-safe without a Paperclip resource lease. `shared_write`, `deploy`, and `external_action` require an exclusive lease before their adapter run may start.
 
-Resource enforcement is opt-in per issue during the canary phase. An issue opts in through `executionWorkspaceSettings.resourceControl` with an explicit `actionClass`, concrete `resourceKey`, stable `changeId`, and stable `idempotencyKey`. Issues without that explicit block retain the previous scheduling behavior; Paperclip does not infer permission for external parallel writes, and this slice does not raise any agent's general `maxConcurrentRuns` value.
+Resource enforcement is opt-in per issue during the canary phase. An issue opts in through `executionWorkspaceSettings.resourceControl` with an explicit `actionClass`, concrete `resourceKey`, stable `changeId`, and stable `idempotencyKey`. Issues without that explicit block retain the previous scheduling behavior unless the separate resource-control rollout is explicitly set to `enforce` for their company. Resource rollout uses `PAPERCLIP_RESOURCE_CONTROL_MODE=off|shadow|enforce` plus `PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS`; it defaults to `shadow`, and a configured `enforce` falls back to `shadow` for every company outside that allowlist. Delivery-control rollout variables do not activate resource-control denial. Paperclip does not infer permission for external parallel writes, and this slice does not raise any agent's general `maxConcurrentRuns` value.
 
 For an opted-in exclusive action, Paperclip:
 
 - takes a company/resource PostgreSQL transaction lock before inspecting or creating the durable lease
 - stores one active lease per `(companyId, resourceKey)` with a monotonically increasing fencing token
 - claims the lease, the queued heartbeat run, and the assigned issue execution lock in one transaction
-- renews a live lease from runtime progress at most once per minute
+- renews a live lease from observable adapter output or runtime progress at most once per minute; process existence alone never renews it
 - leaves conflicting runs `queued` instead of starting their adapters
 - exposes `actionClass`, `resourceKey`, `waitReason`, `blockingRunId`, `waitingSinceAt`, `queuePosition`, and `nextCheckAt` on run read models
 - releases the lease when the owner run becomes terminal, without claiming that a successful process exit proves external target-state readback
 
-An expired lease is changed to `recovery_required`; it is never automatically stolen. A same-idempotency retry is also held until the target state is read back. Only a succeeded owner run plus an explicit target-state readback can change the audit row to `completed` and make a subsequent identical request a confirmed replay rather than another external action.
+An expired lease is changed to `recovery_required`; it is never automatically stolen. A same-idempotency retry is also held until the target state is read back. A board operator with company-management permission resolves the row through `POST /api/heartbeat-runs/{runId}/resource-control-recovery`, supplying the observed change, fencing token, readback evidence, disposition, and reason. Verified completion changes the audit row to `completed`. Verified `not_applied` recovery permits a same-change retry by reacquiring the durable row with a strictly higher fencing token while retaining the previous readback in its audit metadata.
 
 The assigned-issue execution lock follows the same atomicity rule even when resource control is not opted in: `heartbeat_runs.status = running` and `issues.executionRunId = run.id` are committed together under an issue-row lock. If another run already owns the assigned issue, the later run stays queued and no second adapter starts.
 
@@ -619,11 +619,11 @@ The accepted limits are:
 | `critical` | 5 minutes | 15 minutes | 30 minutes | 30 minutes |
 | `high` | 15 minutes | 30 minutes | 60 minutes | 2 hours |
 
-Start-SLA risk begins at 80% of the limit. A queued wake counts as covered only before the start deadline and only when queue capacity is available. An active run counts as live only while it has recent progress, owns a coherent issue execution lock, and has no orphaned resource lock. Comments and unmanaged processes remain evidence only. `scheduled_retry`, a future monitor, typed review/approval, a healthy explicit `blocks` dependency path, an explicit recovery action, or a human owner are durable covered paths.
+Start-SLA risk begins at 80% of the limit. A queued wake counts as covered only before the start deadline and only when queue capacity is available. An active run counts as live only while it has recent progress, owns a coherent issue execution lock, and has no orphaned resource lock. Comments, unmanaged processes, and a human assignee without a scheduled next check remain evidence only. `scheduled_retry`, a future monitor, a fresh typed review/approval, a healthy explicit `blocks` dependency path, or an explicit recovery action with a future check are durable covered paths.
 
 Automatic recovery is capped at two attempt-scoped wakes. Exhaustion requires a first-class blocker/recovery surface. Critical-path propagation follows explicit `blocks` edges only, never `parentId`, and reports dependency depth beyond three or cycles instead of recursing indefinitely. The incident lane admits at most three active technical packages.
 
-Rollout is `off | shadow | enforce`, defaults to `shadow`, and `enforce` is selected only for company ids in `PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS`. The current reconciliation pass is deliberately mutation-free: it writes deduplicated, machine-readable activity observations and fails open per issue. Canary mutation handlers must consume the same evaluation contract before `enforce` can change issue, wake, recovery, or communication state.
+Rollout is `off | shadow | enforce`, defaults to `shadow`, and `enforce` is selected only for company ids in `PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS`. Shadow writes deduplicated, machine-readable observations without changing delivery state. For allowlisted companies, enforce uses the same evaluation contract to propagate critical-path priority, enqueue at most two attempt-scoped recovery wakes, create one source-scoped CEO escalation, persist a first-class exhausted blocker, resolve recovered actions, and emit delta-only communication. Each issue is isolated so one failed reconciliation does not stop the remaining scan.
 
 User-facing communication is delta-based. A phase change, real blocker, SLA risk, user decision, live acceptance, or long-run progress delta may emit an update only when `completed`, `currentAction`, `remaining`, `owner`, and `nextCheckAt` are present. A stable issue/reason/delta key suppresses duplicates; elapsed time without a state or progress delta does not produce a heartbeat message.
 

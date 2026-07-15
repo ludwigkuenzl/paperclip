@@ -82,6 +82,70 @@ export async function acquireResourceControlLease(
     .limit(1)
     .then((rows) => rows[0] ?? null);
   if (sameChange) {
+    const recoveryMetadata = sameChange.metadata?.recovery;
+    const verifiedNotApplied = sameChange.status === "released" &&
+      sameChange.targetReadbackVerifiedAt != null &&
+      recoveryMetadata != null &&
+      typeof recoveryMetadata === "object" &&
+      !Array.isArray(recoveryMetadata) &&
+      (recoveryMetadata as Record<string, unknown>).disposition === "not_applied";
+    if (verifiedNotApplied) {
+      const conflictingLease = await tx
+        .select()
+        .from(resourceControlLeases)
+        .where(and(
+          eq(resourceControlLeases.companyId, input.companyId),
+          eq(resourceControlLeases.resourceKey, input.resourceKey),
+          inArray(resourceControlLeases.status, ["active", "recovery_required"]),
+          sql`${resourceControlLeases.id} <> ${sameChange.id}`,
+        ))
+        .orderBy(desc(resourceControlLeases.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (conflictingLease?.status === "active") {
+        return decision("wait", conflictingLease, "resource_lease_held_by_another_run");
+      }
+      if (conflictingLease?.status === "recovery_required") {
+        return decision("recovery_required", conflictingLease, "resource_recovery_must_complete_before_retry");
+      }
+      const [{ nextToken }] = await tx
+        .select({
+          nextToken: sql<number>`coalesce(max(${resourceControlLeases.fencingToken}), 0) + 1`,
+        })
+        .from(resourceControlLeases)
+        .where(and(
+          eq(resourceControlLeases.companyId, input.companyId),
+          eq(resourceControlLeases.resourceKey, input.resourceKey),
+        ));
+      const retried = await tx
+        .update(resourceControlLeases)
+        .set({
+          ownerRunId: input.runId,
+          issueId: input.issueId,
+          fencingToken: Number(nextToken),
+          status: "active",
+          acquiredAt: now,
+          renewedAt: now,
+          expiresAt: nextLeaseExpiry(now, ttlMs),
+          releasedAt: null,
+          releaseReason: null,
+          targetReadbackVerifiedAt: null,
+          metadata: {
+            ...(sameChange.metadata ?? {}),
+            leaseProtocol: "resource_control_v1",
+            previousRecovery: recoveryMetadata,
+            recovery: null,
+          },
+          updatedAt: now,
+        })
+        .where(and(
+          eq(resourceControlLeases.id, sameChange.id),
+          eq(resourceControlLeases.status, "released"),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (retried) return decision("acquired", retried, "verified_not_applied_change_reacquired");
+    }
     if (
       sameChange.status === "active" &&
       sameChange.ownerRunId === input.runId &&
@@ -193,7 +257,18 @@ export async function acquireResourceControlLease(
 export async function renewResourceControlLeaseForRun(
   db: Db,
   runId: string,
-  opts?: { now?: Date; ttlMs?: number },
+  opts?: {
+    now?: Date;
+    ttlMs?: number;
+    /**
+     * When true, renewal is permitted only after durable run progress newer
+     * than the lease's previous renewal. The scheduler uses this mode so a
+     * hung adapter cannot retain an exclusive resource merely because its
+     * process is still alive.
+     */
+    requireUsefulProgress?: boolean;
+    usefulProgressAt?: Date | null;
+  },
 ) {
   const now = opts?.now ?? new Date();
   const ttlMs = Math.max(30_000, opts?.ttlMs ?? DEFAULT_RESOURCE_LEASE_TTL_MS);
@@ -220,10 +295,112 @@ export async function renewResourceControlLeaseForRun(
         .returning()
         .then((rows) => rows[0] ?? null);
     }
+    if (
+      opts?.requireUsefulProgress &&
+      (!opts.usefulProgressAt || opts.usefulProgressAt <= lease.renewedAt)
+    ) {
+      return lease;
+    }
     return tx
       .update(resourceControlLeases)
       .set({ renewedAt: now, expiresAt: nextLeaseExpiry(now, ttlMs), updatedAt: now })
       .where(eq(resourceControlLeases.id, lease.id))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  });
+}
+
+export type ResourceControlRecoveryDisposition = "completed" | "not_applied";
+
+/**
+ * Resolve an expired or unverified released lease only after a board operator has read the target
+ * state. Recovery is intentionally separate from acquisition: a waiter may
+ * never infer that an expired owner did or did not apply its change.
+ */
+export async function resolveResourceControlRecoveryAfterReadback(
+  db: Db,
+  input: {
+    companyId: string;
+    runId: string;
+    disposition: ResourceControlRecoveryDisposition;
+    observedChangeId: string | null;
+    observedFencingToken: number | null;
+    readback: Record<string, unknown>;
+    reason: string;
+    now?: Date;
+  },
+) {
+  const now = input.now ?? new Date();
+  const reason = input.reason.trim();
+  if (!reason) throw new Error("Resource-control recovery requires an operator reason");
+  if (Object.keys(input.readback).length === 0) {
+    throw new Error("Resource-control recovery requires target readback evidence");
+  }
+
+  return db.transaction(async (tx) => {
+    const lease = await tx
+      .select()
+      .from(resourceControlLeases)
+      .where(and(
+        eq(resourceControlLeases.companyId, input.companyId),
+        eq(resourceControlLeases.ownerRunId, input.runId),
+        inArray(resourceControlLeases.status, ["recovery_required", "released"]),
+      ))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!lease) return null;
+
+    const ownerRun = await tx
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!ownerRun || !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(ownerRun.status)) {
+      throw new Error("Resource-control recovery requires a terminal owner run");
+    }
+
+    if (
+      input.disposition === "completed" &&
+      (
+        input.observedChangeId !== lease.changeId ||
+        input.observedFencingToken !== lease.fencingToken
+      )
+    ) {
+      throw new Error("Completed recovery readback must match the lease change and fencing token");
+    }
+
+    const completed = input.disposition === "completed";
+    return tx
+      .update(resourceControlLeases)
+      .set({
+        status: completed ? "completed" : "released",
+        releasedAt: now,
+        targetReadbackVerifiedAt: now,
+        releaseReason: completed
+          ? "recovery_target_readback_verified_completed"
+          : "recovery_target_readback_verified_not_applied",
+        metadata: {
+          ...(lease.metadata ?? {}),
+          leaseProtocol: "resource_control_v1",
+          recovery: {
+            disposition: input.disposition,
+            observedChangeId: input.observedChangeId,
+            observedFencingToken: input.observedFencingToken,
+            reason,
+            readback: input.readback,
+            verifiedAt: now.toISOString(),
+          },
+        },
+        updatedAt: now,
+      })
+      .where(and(
+        eq(resourceControlLeases.id, lease.id),
+        eq(resourceControlLeases.status, lease.status),
+      ))
       .returning()
       .then((rows) => rows[0] ?? null);
   });

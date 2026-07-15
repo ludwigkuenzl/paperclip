@@ -55,7 +55,6 @@ export const DELIVERY_CONTROL_CONTRACT_V1 = {
       "typed_review_or_approval",
       "live_dependency_path",
       "explicit_recovery_action",
-      "human_owner",
     ],
     commentsAndBackgroundProcessesAreEvidenceOnly: true,
   },
@@ -124,7 +123,7 @@ export interface DeliveryControlResourceLeaseSnapshot {
   ownerRunId: string;
   changeId: string;
   idempotencyKey: string;
-  status: "active" | "completed" | "released" | "expired" | "failed";
+  status: "active" | "completed" | "released" | "recovery_required";
   acquiredAt: Date | string;
   expiresAt: Date | string;
   completedAt?: Date | string | null;

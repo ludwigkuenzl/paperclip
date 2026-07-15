@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { evaluateIssueResourceLease, resolveIssueResourceControl } from "./resource-control.js";
+import {
+  evaluateIssueResourceLease,
+  readResourceControlConfig,
+  resolveIssueResourceControl,
+  resolveResourceControlClaimGate,
+} from "./resource-control.js";
 
 const baseIssue = {
   id: "issue-1",
@@ -58,6 +63,60 @@ describe("resource control issue classification", () => {
       resourceKey: "vps:production",
       changeId: "sha-123",
       idempotencyKey: "resource_control:company-1:deploy:vps%3Aproduction:sha-123",
+      blockedReason: null,
+    });
+  });
+
+  it("keeps inferred shared writes in shadow but fails closed in the company canary", () => {
+    const inferred = resolveIssueResourceControl(baseIssue);
+    expect(resolveResourceControlClaimGate(inferred, "shadow")).toEqual({
+      enforced: false,
+      blockedReason: null,
+    });
+    expect(resolveResourceControlClaimGate(inferred, "enforce")).toEqual({
+      enforced: true,
+      blockedReason: "exclusive_action_requires_explicit_resource_change_and_idempotency_context",
+    });
+  });
+
+  it("requires its own explicit company canary independently of delivery control", () => {
+    const notAllowlisted = readResourceControlConfig("company-1", {
+      mode: "enforce",
+      canaryCompanyIds: "company-2, company-3",
+    });
+    expect(notAllowlisted).toMatchObject({ configuredMode: "enforce", effectiveMode: "shadow" });
+    expect(resolveResourceControlClaimGate(
+      resolveIssueResourceControl(baseIssue),
+      notAllowlisted.effectiveMode,
+    )).toEqual({ enforced: false, blockedReason: null });
+    expect(readResourceControlConfig("company-1", {
+      mode: "enforce",
+      canaryCompanyIds: "company-2, company-1",
+    })).toMatchObject({ configuredMode: "enforce", effectiveMode: "enforce" });
+    expect(readResourceControlConfig("company-1", {
+      mode: "off",
+      canaryCompanyIds: "company-1",
+    })).toMatchObject({ configuredMode: "off", effectiveMode: "off" });
+  });
+
+  it("preserves explicit external lease enforcement without adding a global rollout gate", () => {
+    const external = resolveIssueResourceControl({
+      ...baseIssue,
+      executionWorkspaceSettings: {
+        resourceControl: {
+          actionClass: "external_action",
+          resourceKey: "customer:123",
+          changeId: "message-1",
+          idempotencyKey: "customer-123-message-1",
+        },
+      },
+    });
+    expect(resolveResourceControlClaimGate(external, "shadow")).toEqual({
+      enforced: true,
+      blockedReason: null,
+    });
+    expect(resolveResourceControlClaimGate(external, "enforce")).toEqual({
+      enforced: true,
       blockedReason: null,
     });
   });

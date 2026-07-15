@@ -206,11 +206,16 @@ import {
 } from "./recovery/model-profile-hint.js";
 import { recoveryService } from "./recovery/service.js";
 import { reconcileDeliveryControlShadow } from "./delivery-control-shadow.js";
-import { resolveIssueResourceControl } from "./resource-control.js";
+import {
+  readResourceControlConfig,
+  resolveIssueResourceControl,
+  resolveResourceControlClaimGate,
+} from "./resource-control.js";
 import {
   acquireResourceControlLease,
   listResourceQueueTelemetry,
   releaseResourceControlLeaseForRun,
+  resolveResourceControlRecoveryAfterReadback,
   renewResourceControlLeaseForRun,
   type ResourceControlLeaseDecision,
 } from "./resource-control-leases.js";
@@ -557,6 +562,7 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
 const resourceLeaseRenewedAtByRun = new Map<string, number>();
+const resourceLeaseUsefulProgressAtByRun = new Map<string, Date>();
 const RESOURCE_LEASE_RENEWAL_INTERVAL_MS = 60_000;
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
@@ -5814,16 +5820,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
-    const lastRenewedAt = resourceLeaseRenewedAtByRun.get(run.id) ?? 0;
-    if (Date.now() - lastRenewedAt >= RESOURCE_LEASE_RENEWAL_INTERVAL_MS) {
-      const lease = await renewResourceControlLeaseForRun(db, run.id);
-      if (lease?.status === "recovery_required") {
-        throw new Error(`Resource lease for run ${run.id} expired before renewal; recovery is required`);
-      }
-      if (lease) resourceLeaseRenewedAtByRun.set(run.id, Date.now());
-    }
+    const receivedAt = new Date();
+    const reportedAt = update.lastEventAt ? new Date(update.lastEventAt) : receivedAt;
+    // Never let an adapter-supplied future timestamp become a reusable lease
+    // renewal token. It is evidence for this event only, at receipt time.
+    const usefulProgressAt = Number.isNaN(reportedAt.getTime()) || reportedAt > receivedAt
+      ? receivedAt
+      : reportedAt;
+    await renewResourceLeaseAfterUsefulProgress(run.id, usefulProgressAt);
 
     return recordHeartbeatRunRuntimeProgress(currentRun, update, issueId);
+  }
+
+  async function renewResourceLeaseAfterUsefulProgress(runId: string, usefulProgressAt = new Date()) {
+    if (!resourceLeaseRenewedAtByRun.has(runId)) return null;
+    const previousProgressAt = resourceLeaseUsefulProgressAtByRun.get(runId);
+    if (!previousProgressAt || usefulProgressAt > previousProgressAt) {
+      resourceLeaseUsefulProgressAtByRun.set(runId, usefulProgressAt);
+    }
+    const lastRenewedAt = resourceLeaseRenewedAtByRun.get(runId) ?? 0;
+    if (Date.now() - lastRenewedAt < RESOURCE_LEASE_RENEWAL_INTERVAL_MS) return null;
+    const latestUsefulProgressAt = resourceLeaseUsefulProgressAtByRun.get(runId) ?? null;
+    const lease = await renewResourceControlLeaseForRun(db, runId, {
+      requireUsefulProgress: true,
+      usefulProgressAt: latestUsefulProgressAt,
+    });
+    if (lease?.status === "recovery_required") {
+      throw new Error(`Resource lease for run ${runId} expired before progress-backed renewal; recovery is required`);
+    }
+    if (lease && latestUsefulProgressAt && latestUsefulProgressAt > lease.renewedAt) {
+      // A concurrent progress event landed after this renewal; retain it for
+      // the next interval. Otherwise the renewed timestamp is authoritative.
+      resourceLeaseUsefulProgressAtByRun.set(runId, latestUsefulProgressAt);
+    }
+    if (lease && lease.renewedAt.getTime() > lastRenewedAt) {
+      resourceLeaseRenewedAtByRun.set(runId, lease.renewedAt.getTime());
+    }
+    return lease;
   }
 
   async function getRunLogAccess(runId: string) {
@@ -10333,14 +10366,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimedWakeReason = readNonEmptyString(context.wakeReason);
     let claimed: typeof heartbeatRuns.$inferSelect | null;
     let resourceLeaseDecision: ResourceControlLeaseDecision | null = null;
     try {
       const transactionResult = await db.transaction(async (tx) => {
         let locksAssignedIssue = false;
         let leaseDecision: ResourceControlLeaseDecision | null = null;
-        if (issueId && claimedWakeReason !== "source_scoped_recovery_action") {
+        if (issueId) {
           const lockedIssue = await tx
             .select({
               id: issues.id,
@@ -10375,11 +10407,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
 
           const resourceControl = resolveIssueResourceControl(lockedIssue);
-          if (
-            resourceControl.source === "explicit" &&
-            resourceControl.leaseRequired
-          ) {
-            if (!locksAssignedIssue) {
+          const resourceControlMode = readResourceControlConfig(lockedIssue.companyId).effectiveMode;
+          const resourceControlGate = resolveResourceControlClaimGate(resourceControl, resourceControlMode);
+          if (resourceControlGate.enforced) {
+            if (resourceControlGate.blockedReason) {
+              leaseDecision = {
+                outcome: "denied",
+                lease: null,
+                blockingRunId: null,
+                reason: resourceControlGate.blockedReason,
+                nextCheckAt: null,
+              };
+            } else if (!locksAssignedIssue) {
               leaseDecision = {
                 outcome: "denied",
                 lease: null,
@@ -10388,7 +10427,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 nextCheckAt: null,
               };
             } else if (
-              resourceControl.blockedReason ||
               !resourceControl.changeId ||
               !resourceControl.idempotencyKey
             ) {
@@ -10396,7 +10434,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 outcome: "denied",
                 lease: null,
                 blockingRunId: null,
-                reason: resourceControl.blockedReason ?? "resource_change_context_required",
+                reason: "resource_change_context_required",
                 nextCheckAt: null,
               };
             } else {
@@ -10416,12 +10454,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
 
+        const claimedResourceLease = leaseDecision?.lease &&
+          (leaseDecision.outcome === "acquired" || leaseDecision.outcome === "owned")
+          ? leaseDecision.lease
+          : null;
+        const claimedContext = claimedResourceLease
+          ? {
+              ...context,
+              paperclipResourceControl: {
+                leaseId: claimedResourceLease.id,
+                actionClass: claimedResourceLease.actionClass,
+                resourceKey: claimedResourceLease.resourceKey,
+                changeId: claimedResourceLease.changeId,
+                idempotencyKey: claimedResourceLease.idempotencyKey,
+                fencingToken: claimedResourceLease.fencingToken,
+                acquiredAt: claimedResourceLease.acquiredAt.toISOString(),
+                expiresAt: claimedResourceLease.expiresAt.toISOString(),
+              },
+            }
+          : context;
         const claimedRun = await tx
           .update(heartbeatRuns)
           .set({
             status: "running",
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
+            contextSnapshot: claimedContext,
             updatedAt: claimedAt,
           })
           .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
@@ -10515,7 +10573,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
     if (resourceLeaseDecision?.lease) {
-      resourceLeaseRenewedAtByRun.set(claimed.id, claimedAt.getTime());
+      resourceLeaseRenewedAtByRun.set(claimed.id, resourceLeaseDecision.lease.renewedAt.getTime());
+      resourceLeaseUsefulProgressAtByRun.delete(claimed.id);
     }
 
     publishLiveEvent({
@@ -11313,7 +11372,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reconcilePriorityDeliveryControl(opts?: { companyId?: string | null; now?: Date; limit?: number }) {
-    return reconcileDeliveryControlShadow(db, opts);
+    return reconcileDeliveryControlShadow(db, opts, { enqueueWakeup });
   }
 
   async function updateRuntimeState(
@@ -11484,7 +11543,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let resourceLeaseRenewalTimer: NodeJS.Timeout | null = null;
     if (resourceLeaseRenewedAtByRun.has(run.id)) {
       resourceLeaseRenewalTimer = setInterval(() => {
-        void renewResourceControlLeaseForRun(db, run.id)
+        void renewResourceControlLeaseForRun(db, run.id, {
+          requireUsefulProgress: true,
+          usefulProgressAt: resourceLeaseUsefulProgressAtByRun.get(run.id) ?? null,
+        })
           .then(async (lease) => {
             if (!lease) return;
             if (lease.status === "recovery_required") {
@@ -11495,7 +11557,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
               return;
             }
-            resourceLeaseRenewedAtByRun.set(run.id, Date.now());
+            resourceLeaseRenewedAtByRun.set(run.id, lease.renewedAt.getTime());
           })
           .catch((leaseRenewalError) => {
             logger.error(
@@ -12028,6 +12090,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
+    const resourceControlContext = parseObject(context.paperclipResourceControl);
+    const resourceFencingToken = typeof resourceControlContext.fencingToken === "number" &&
+      Number.isSafeInteger(resourceControlContext.fencingToken) &&
+      resourceControlContext.fencingToken > 0
+      ? resourceControlContext.fencingToken
+      : null;
+    if (resourceFencingToken != null) {
+      const existingRuntimeEnv = parseObject(runtimeConfig.env);
+      runtimeConfig = {
+        ...runtimeConfig,
+        env: {
+          ...existingRuntimeEnv,
+          PAPERCLIP_RESOURCE_LEASE_ID: readNonEmptyString(resourceControlContext.leaseId) ?? "",
+          PAPERCLIP_RESOURCE_ACTION_CLASS: readNonEmptyString(resourceControlContext.actionClass) ?? "",
+          PAPERCLIP_RESOURCE_KEY: readNonEmptyString(resourceControlContext.resourceKey) ?? "",
+          PAPERCLIP_RESOURCE_CHANGE_ID: readNonEmptyString(resourceControlContext.changeId) ?? "",
+          PAPERCLIP_RESOURCE_IDEMPOTENCY_KEY:
+            readNonEmptyString(resourceControlContext.idempotencyKey) ?? "",
+          PAPERCLIP_RESOURCE_FENCING_TOKEN: String(resourceFencingToken),
+        },
+      };
+    }
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
     const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
       adapterType: agent.adapterType,
@@ -12888,6 +12972,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const sanitizedChunk = compactRunLogChunk(
           redactCurrentUserText(chunk, currentUserRedactionOptions),
         );
+        if (sanitizedChunk.trim().length > 0) {
+          await renewResourceLeaseAfterUsefulProgress(run.id, new Date());
+        }
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
         const ts = new Date().toISOString();
@@ -13952,6 +14039,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
           resourceLeaseRenewedAtByRun.delete(run.id);
+          resourceLeaseUsefulProgressAtByRun.delete(run.id);
           await releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,
@@ -16562,6 +16650,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     listResourceQueueTelemetry: (companyId: string, runIds?: string[]) =>
       listResourceQueueTelemetry(db, companyId, runIds),
+
+    resolveResourceControlRecoveryAfterReadback: (input: Parameters<
+      typeof resolveResourceControlRecoveryAfterReadback
+    >[1]) => resolveResourceControlRecoveryAfterReadback(db, input),
 
     decorateActiveRunStatus: decorateHeartbeatRunRuntimeStatus,
     recordRuntimeProgress: recordCurrentHeartbeatRunRuntimeProgress,

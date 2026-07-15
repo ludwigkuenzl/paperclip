@@ -14,6 +14,7 @@ import {
   confirmResourceControlTargetReadback,
   listResourceQueueTelemetry,
   releaseResourceControlLeaseForRun,
+  resolveResourceControlRecoveryAfterReadback,
   renewResourceControlLeaseForRun,
 } from "./resource-control-leases.js";
 import {
@@ -173,9 +174,93 @@ describeEmbeddedPostgres("resource-control leases", () => {
     expect(lease?.status).toBe("recovery_required");
   });
 
+  it("unblocks a recovered resource only after terminal-owner target readback", async () => {
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date("2026-07-15T00:06:10.000Z") })
+      .where(eq(heartbeatRuns.id, runIds[0]!));
+
+    const recovered = await resolveResourceControlRecoveryAfterReadback(db, {
+      companyId,
+      runId: runIds[0]!,
+      disposition: "not_applied",
+      observedChangeId: null,
+      observedFencingToken: null,
+      readback: { deployedRevision: "sha-before" },
+      reason: "Production still reports the pre-change revision.",
+      now: new Date("2026-07-15T00:06:20.000Z"),
+    });
+    expect(recovered).toMatchObject({
+      status: "released",
+      releaseReason: "recovery_target_readback_verified_not_applied",
+      targetReadbackVerifiedAt: new Date("2026-07-15T00:06:20.000Z"),
+    });
+
+    const next = await db.transaction((tx) => acquireResourceControlLease(tx, {
+      companyId,
+      issueId,
+      runId: runIds[1]!,
+      actionClass: "deploy",
+      resourceKey: "deploy:production",
+      changeId: "sha-1",
+      idempotencyKey: "deploy-production-sha-1",
+      now: new Date("2026-07-15T00:06:30.000Z"),
+    }));
+    expect(next.outcome).toBe("acquired");
+    expect(next.lease?.fencingToken).toBe(2);
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date("2026-07-15T00:12:00.000Z") })
+      .where(eq(heartbeatRuns.id, runIds[1]!));
+    const stalled = await renewResourceControlLeaseForRun(db, runIds[1]!, {
+      now: new Date("2026-07-15T00:12:00.000Z"),
+      requireUsefulProgress: true,
+      usefulProgressAt: null,
+    });
+    expect(stalled).toMatchObject({
+      status: "recovery_required",
+      releaseReason: "lease_expired_before_renewal",
+    });
+    await expect(resolveResourceControlRecoveryAfterReadback(db, {
+      companyId,
+      runId: runIds[1]!,
+      disposition: "completed",
+      observedChangeId: "sha-1",
+      observedFencingToken: 1,
+      readback: { deployedRevision: "sha-1", fencingToken: 1 },
+      reason: "Read production revision and target fencing token.",
+      now: new Date("2026-07-15T00:12:10.000Z"),
+    })).rejects.toThrow("must match the lease change and fencing token");
+    const completed = await resolveResourceControlRecoveryAfterReadback(db, {
+      companyId,
+      runId: runIds[1]!,
+      disposition: "completed",
+      observedChangeId: "sha-1",
+      observedFencingToken: 2,
+      readback: { deployedRevision: "sha-1", fencingToken: 2 },
+      reason: "Read production revision and target fencing token.",
+      now: new Date("2026-07-15T00:12:20.000Z"),
+    });
+    expect(completed).toMatchObject({
+      status: "completed",
+      releaseReason: "recovery_target_readback_verified_completed",
+    });
+  });
+
   it("renews only before expiry and releases without claiming target readback", async () => {
+    const unchanged = await renewResourceControlLeaseForRun(db, runIds[2]!, {
+      now: new Date("2026-07-15T00:01:30.000Z"),
+      requireUsefulProgress: true,
+      usefulProgressAt: null,
+    });
+    expect(unchanged?.renewedAt.toISOString()).toBe("2026-07-15T00:01:00.000Z");
+    expect(unchanged?.expiresAt.toISOString()).toBe("2026-07-15T00:06:00.000Z");
+
     const renewed = await renewResourceControlLeaseForRun(db, runIds[2]!, {
       now: new Date("2026-07-15T00:02:00.000Z"),
+      requireUsefulProgress: true,
+      usefulProgressAt: new Date("2026-07-15T00:01:45.000Z"),
     });
     expect(renewed?.status).toBe("active");
     expect(renewed?.expiresAt.toISOString()).toBe("2026-07-15T00:07:00.000Z");

@@ -14,6 +14,8 @@ import {
 import { ExternalLink } from "lucide-react";
 import { Identity } from "./Identity";
 import { RunChatSurface } from "./RunChatSurface";
+import { QueueTelemetryDetails, RunQueueWaitBadge } from "./RunQueueWait";
+import { isRunLive, isRunQueued } from "../lib/run-queue-status";
 import { useLiveRunTranscripts } from "./transcript/useLiveRunTranscripts";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
 import { Badge } from "@/components/ui/badge";
@@ -47,10 +49,6 @@ const DASHBOARD_LOG_POLL_INTERVAL_MS = 15_000;
 const DASHBOARD_LOG_READ_LIMIT_BYTES = 64_000;
 const DASHBOARD_MAX_CHUNKS_PER_RUN = 40;
 const EMPTY_TRANSCRIPT: TranscriptEntry[] = [];
-
-function isRunActive(run: LiveRunForIssue): boolean {
-  return run.status === "queued" || run.status === "running";
-}
 
 interface ActiveAgentsPanelProps {
   companyId: string;
@@ -146,7 +144,6 @@ export function ActiveAgentsPanel({
               issue={run.issueId ? issueById.get(run.issueId) : undefined}
               transcript={transcriptByRun.get(run.id) ?? EMPTY_TRANSCRIPT}
               hasOutput={hasOutputForRun(run.id)}
-              isActive={isRunActive(run)}
               className={cardClassName}
             />
           ))}
@@ -169,7 +166,6 @@ const AgentRunCard = memo(function AgentRunCard({
   issue,
   transcript,
   hasOutput,
-  isActive,
   className,
 }: {
   companyId: string;
@@ -177,33 +173,42 @@ const AgentRunCard = memo(function AgentRunCard({
   issue?: Issue;
   transcript: TranscriptEntry[];
   hasOutput: boolean;
-  isActive: boolean;
   className?: string;
 }) {
+  const live = isRunLive(run.status);
+  const queued = isRunQueued(run.status);
   return (
     <div className={cn(
       "flex h-(--sz-320px) flex-col overflow-hidden rounded-xl border shadow-sm",
-      isActive
+      live
         ? "border-blue-500/25 bg-blue-500/[0.04] shadow-(--shadow-extract-1)"
-        : "border-border bg-background/70",
+        : queued
+          ? "border-amber-500/30 bg-amber-500/[0.04]"
+          : "border-border bg-background/70",
       className,
     )}>
       <div className="border-b border-border/60 px-3 py-3">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              {isActive ? (
+              {live ? (
                 <span className="relative flex h-2.5 w-2.5 shrink-0">
                   <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-70" />
                   <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-blue-500" />
                 </span>
+              ) : queued ? (
+                <span className="inline-flex h-2.5 w-2.5 rounded-full bg-amber-500 shrink-0" />
               ) : (
                 <span className="inline-flex h-2.5 w-2.5 rounded-full bg-muted-foreground/35" />
               )}
               <Identity name={run.agentName} size="sm" className="[&>span:last-child]:!text-(length:--text-micro)" />
             </div>
             <div className="mt-2 flex items-center gap-2 text-(length:--text-micro) text-muted-foreground">
-              <span>{isActive ? "Live now" : run.finishedAt ? `Finished ${relativeTime(run.finishedAt)}` : `Started ${relativeTime(run.createdAt)}`}</span>
+              {queued ? (
+                <RunQueueWaitBadge status={run.status} telemetry={run.resourceQueueTelemetry} />
+              ) : (
+                <span>{live ? "Live now" : run.finishedAt ? `Finished ${relativeTime(run.finishedAt)}` : `Started ${relativeTime(run.createdAt)}`}</span>
+              )}
             </div>
           </div>
 
@@ -221,7 +226,7 @@ const AgentRunCard = memo(function AgentRunCard({
               to={`/issues/${issue?.identifier ?? run.issueId}`}
               className={cn(
                 "line-clamp-2 hover:underline",
-                isActive ? "text-blue-700 dark:text-blue-300" : "text-muted-foreground hover:text-foreground",
+                live ? "text-blue-700 dark:text-blue-300" : "text-muted-foreground hover:text-foreground",
               )}
               title={issue?.title ? `${issue?.identifier ?? run.issueId.slice(0, 8)} - ${issue.title}` : issue?.identifier ?? run.issueId.slice(0, 8)}
             >
@@ -235,6 +240,12 @@ const AgentRunCard = memo(function AgentRunCard({
             ) : null}
           </div>
         )}
+
+        {run.resourceQueueTelemetry ? (
+          <div className="mt-3">
+            <QueueTelemetryDetails telemetry={run.resourceQueueTelemetry} />
+          </div>
+        ) : null}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
