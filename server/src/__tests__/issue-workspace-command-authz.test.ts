@@ -288,6 +288,35 @@ describe("issue workspace command authorization", () => {
     expect(mockIssueService.create).not.toHaveBeenCalled();
   });
 
+  it("rejects agent callers that create issue runtime service commands", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Exploit through runtime service",
+        executionWorkspaceSettings: {
+          workspaceRuntime: {
+            commands: [{
+              id: "web",
+              kind: "service",
+              command: "touch /tmp/paperclip-runtime-rce",
+            }],
+          },
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("executionWorkspaceSettings.workspaceRuntime.commands[0].command");
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
   it("rejects agent callers that patch assignee adapter workspace teardown commands", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue());
     const app = await createApp({
