@@ -198,6 +198,27 @@ describe("delivery-control SLA and liveness shadow evaluator", () => {
     }).effectiveMode).toBe("shadow");
     expect(readDeliveryControlConfig(companyId, { mode: "invalid" }).effectiveMode).toBe("shadow");
   });
+
+  it("can restrict enforcement to selected issues while retaining company-wide shadow evaluation", () => {
+    expect(readDeliveryControlConfig(companyId, {
+      mode: "enforce",
+      canaryCompanyIds: companyId,
+      issueId,
+      canaryIssueIds: `another-issue, ${issueId}`,
+    }).effectiveMode).toBe("enforce");
+    expect(readDeliveryControlConfig(companyId, {
+      mode: "enforce",
+      canaryCompanyIds: companyId,
+      issueId,
+      canaryIssueIds: "another-issue",
+    }).effectiveMode).toBe("shadow");
+    expect(readDeliveryControlConfig(companyId, {
+      mode: "enforce",
+      canaryCompanyIds: companyId,
+      issueId,
+      canaryIssueIds: "",
+    }).effectiveMode).toBe("enforce");
+  });
 });
 
 describe("delivery-control delta communication", () => {

@@ -33,6 +33,7 @@ describeEmbeddedPostgres("delivery-control shadow reconciliation", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const previousMode = process.env.PAPERCLIP_DELIVERY_CONTROL_MODE;
   const previousCompanyIds = process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS;
+  const previousIssueIds = process.env.PAPERCLIP_DELIVERY_CONTROL_ISSUE_IDS;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-delivery-control-shadow-");
@@ -53,6 +54,8 @@ describeEmbeddedPostgres("delivery-control shadow reconciliation", () => {
     else process.env.PAPERCLIP_DELIVERY_CONTROL_MODE = previousMode;
     if (previousCompanyIds === undefined) delete process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS;
     else process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS = previousCompanyIds;
+    if (previousIssueIds === undefined) delete process.env.PAPERCLIP_DELIVERY_CONTROL_ISSUE_IDS;
+    else process.env.PAPERCLIP_DELIVERY_CONTROL_ISSUE_IDS = previousIssueIds;
   });
 
   afterAll(async () => {
@@ -405,6 +408,42 @@ describeEmbeddedPostgres("delivery-control shadow reconciliation", () => {
       .select()
       .from(activityLog)
       .where(eq(activityLog.action, "issue.delivery_control_communication"))).toHaveLength(1);
+  });
+
+  it("enforces only selected issue canaries while observing the rest of the company in shadow", async () => {
+    const { companyId, agentId, issueId } = await seedCriticalIssue();
+    const shadowIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: shadowIssueId,
+      companyId,
+      identifier: "DCT-2",
+      title: "Company-wide shadow issue",
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      createdAt: new Date("2026-07-15T00:00:00.000Z"),
+      updatedAt: new Date("2026-07-15T00:00:00.000Z"),
+    });
+    process.env.PAPERCLIP_DELIVERY_CONTROL_MODE = "enforce";
+    process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS = companyId;
+    process.env.PAPERCLIP_DELIVERY_CONTROL_ISSUE_IDS = issueId;
+
+    const result = await reconcileDeliveryControlShadow(db, {
+      companyId,
+      now: new Date("2026-07-15T00:02:00.000Z"),
+    });
+
+    expect(result).toMatchObject({ checked: 2, communicationsEmitted: 1, failed: 0 });
+    expect(await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.delivery_control_enforcement_observation")))
+      .toMatchObject([{ entityId: issueId }]);
+    expect(await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.delivery_control_shadow_finding")))
+      .toMatchObject([{ entityId: shadowIssueId }]);
   });
 
   it("emits recent root live acceptance exactly once and leaves the watchdog terminal", async () => {

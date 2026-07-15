@@ -605,7 +605,7 @@ async function recordGraphControls(
   for (const issue of input.graphIssues) {
     const effectivePriority = input.effectivePriorityByIssueId.get(issue.id) ?? issue.priority as IssuePriority;
     if (priorityRank(effectivePriority) <= priorityRank(issue.priority as IssuePriority)) continue;
-    const config = readDeliveryControlConfig(issue.companyId);
+    const config = readDeliveryControlConfig(issue.companyId, { issueId: issue.id });
     if (config.effectiveMode === "off") continue;
     const eventKey = `delivery_control_priority:${issue.id}:${issue.priority}:${effectivePriority}`;
     if (config.effectiveMode === "enforce") {
@@ -634,7 +634,7 @@ async function recordGraphControls(
     if (recorded && config.effectiveMode === "enforce") priorityPropagated += 1;
   }
   for (const finding of input.incidentLaneFindings) {
-    const config = readDeliveryControlConfig(finding.companyId);
+    const config = readDeliveryControlConfig(finding.companyId, { issueId: finding.rootIssueId });
     if (config.effectiveMode === "off") continue;
     const fingerprint = createHash("sha256").update(JSON.stringify(finding)).digest("hex");
     const recorded = await recordDeliveryControlEventOnce(db, {
@@ -1229,7 +1229,7 @@ async function emitRecentTerminalAcceptances(
     .limit(input.limit);
   let emitted = 0;
   for (const issue of terminalRoots) {
-    if (readDeliveryControlConfig(issue.companyId).effectiveMode !== "enforce") continue;
+    if (readDeliveryControlConfig(issue.companyId, { issueId: issue.id }).effectiveMode !== "enforce") continue;
     const policy = deliveryControlPolicyForPriority(issue.priority)!;
     if (!issue.completedAt || issue.completedAt.getTime() < input.now.getTime() - policy.communicationMaxGapMs) continue;
     const terminalIssue: CandidateIssue = {
@@ -1290,7 +1290,10 @@ export async function reconcileDeliveryControlShadow(
   const blockerAttentionFailedCompanyIds = new Set<string>();
   const blockedCandidatesByCompanyId = new Map<string, typeof candidates>();
   for (const issue of candidates) {
-    if (issue.status !== "blocked" || readDeliveryControlConfig(issue.companyId).effectiveMode === "off") continue;
+    if (
+      issue.status !== "blocked" ||
+      readDeliveryControlConfig(issue.companyId, { issueId: issue.id }).effectiveMode === "off"
+    ) continue;
     const companyIssues = blockedCandidatesByCompanyId.get(issue.companyId) ?? [];
     companyIssues.push(issue);
     blockedCandidatesByCompanyId.set(issue.companyId, companyIssues);
@@ -1306,7 +1309,7 @@ export async function reconcileDeliveryControlShadow(
     }
   }
   for (const issue of candidates) {
-    const config = readDeliveryControlConfig(issue.companyId);
+    const config = readDeliveryControlConfig(issue.companyId, { issueId: issue.id });
     if (config.effectiveMode === "off") {
       result.offSkipped += 1;
       continue;

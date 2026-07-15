@@ -9,6 +9,7 @@ import {
 
 export const DELIVERY_CONTROL_MODE_ENV = "PAPERCLIP_DELIVERY_CONTROL_MODE";
 export const DELIVERY_CONTROL_COMPANY_IDS_ENV = "PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS";
+export const DELIVERY_CONTROL_ISSUE_IDS_ENV = "PAPERCLIP_DELIVERY_CONTROL_ISSUE_IDS";
 
 export type DeliveryControlPhase = "queued" | "active" | "review" | "waiting" | "terminal";
 export type DeliveryControlStartSlaStatus = "not_applicable" | "pending" | "risk" | "met" | "breached";
@@ -123,7 +124,12 @@ export function resolveDeliveryControlMode(value: string | null | undefined): De
 
 export function readDeliveryControlConfig(
   companyId: string,
-  input: { mode?: string | null; canaryCompanyIds?: string | null } = {},
+  input: {
+    mode?: string | null;
+    canaryCompanyIds?: string | null;
+    issueId?: string | null;
+    canaryIssueIds?: string | null;
+  } = {},
 ) {
   const configuredMode = resolveDeliveryControlMode(
     input.mode === undefined ? process.env[DELIVERY_CONTROL_MODE_ENV] : input.mode,
@@ -136,10 +142,28 @@ export function readDeliveryControlConfig(
     ?.split(",")
     .map((value) => value.trim())
     .filter(Boolean) ?? [];
+  const canaryIssueIds = (
+    input.canaryIssueIds === undefined
+      ? process.env[DELIVERY_CONTROL_ISSUE_IDS_ENV]
+      : input.canaryIssueIds
+  )
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean) ?? [];
+  const issueCanaryMatched = canaryIssueIds.length === 0 || Boolean(
+    input.issueId && canaryIssueIds.includes(input.issueId),
+  );
   const effectiveMode: DeliveryControlMode = configuredMode === "enforce"
-    ? canaryCompanyIds.includes(companyId) ? "enforce" : "shadow"
+    ? canaryCompanyIds.includes(companyId) && issueCanaryMatched ? "enforce" : "shadow"
     : configuredMode;
-  return { companyId, configuredMode, effectiveMode, canaryCompanyIds } as const;
+  return {
+    companyId,
+    issueId: input.issueId ?? null,
+    configuredMode,
+    effectiveMode,
+    canaryCompanyIds,
+    canaryIssueIds,
+  } as const;
 }
 
 export function evaluateDeliveryControl(input: DeliveryControlEvaluationInput): DeliveryControlEvaluation {
