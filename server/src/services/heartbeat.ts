@@ -10366,13 +10366,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
+    const claimedWakeReason = readNonEmptyString(context.wakeReason);
+    const interactionWake = allowsIssueInteractionWake(context);
     let claimed: typeof heartbeatRuns.$inferSelect | null;
     let resourceLeaseDecision: ResourceControlLeaseDecision | null = null;
     try {
       const transactionResult = await db.transaction(async (tx) => {
         let locksAssignedIssue = false;
         let leaseDecision: ResourceControlLeaseDecision | null = null;
-        if (issueId) {
+        if (issueId && claimedWakeReason !== "source_scoped_recovery_action") {
           const lockedIssue = await tx
             .select({
               id: issues.id,
@@ -10394,7 +10396,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Mention/context runs may inspect an issue without owning its execution
           // lock. Assigned work must acquire that lock in the same transaction as
           // the queued -> running CAS, so no adapter can start without ownership.
-          locksAssignedIssue = lockedIssue.assigneeAgentId === run.agentId;
+          locksAssignedIssue = !interactionWake && lockedIssue.assigneeAgentId === run.agentId;
           if (
             locksAssignedIssue &&
             (
