@@ -6082,13 +6082,34 @@ export function issueService(db: Db) {
         let executionWorkspacePreference = issueData.executionWorkspacePreference ?? null;
         let executionWorkspaceSettings =
           (issueData.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null;
+        const requestedWorkspaceReuse = issueData.executionWorkspacePreference === "reuse_existing";
+        const requestedActionClass =
+          issueData.executionWorkspaceSettings &&
+          typeof issueData.executionWorkspaceSettings === "object" &&
+          !Array.isArray(issueData.executionWorkspaceSettings) &&
+          issueData.executionWorkspaceSettings.resourceControl &&
+          typeof issueData.executionWorkspaceSettings.resourceControl === "object" &&
+          !Array.isArray(issueData.executionWorkspaceSettings.resourceControl)
+            ? (issueData.executionWorkspaceSettings.resourceControl as Record<string, unknown>).actionClass
+            : null;
+        const inferredReviewWorkspaceSourceIssueId =
+          !inheritExecutionWorkspaceFromIssueId &&
+          issueData.executionWorkspaceId === undefined &&
+          requestedWorkspaceReuse &&
+          requestedActionClass === "review" &&
+          blockedByIssueIds?.length === 1
+            ? blockedByIssueIds[0]
+            : null;
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
-          : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
+          : inheritExecutionWorkspaceFromIssueId ?? inferredReviewWorkspaceSourceIssueId ?? issueData.parentId ?? null;
+        const hasExplicitExecutionWorkspaceIdSelection = issueData.executionWorkspaceId !== undefined;
         const hasExplicitExecutionWorkspaceOverride =
-          issueData.executionWorkspaceId !== undefined ||
-          issueData.executionWorkspacePreference !== undefined ||
-          issueData.executionWorkspaceSettings !== undefined;
+          hasExplicitExecutionWorkspaceIdSelection ||
+          (!requestedWorkspaceReuse && (
+            issueData.executionWorkspacePreference !== undefined ||
+            issueData.executionWorkspaceSettings !== undefined
+          ));
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
           if (issueData.projectId == null && workspaceSource.projectId) {
@@ -6115,10 +6136,16 @@ export function issueService(db: Db) {
               executionWorkspacePreference = "reuse_existing";
               executionWorkspaceSettings = {
                 ...((workspaceSource.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? {}),
+                ...(executionWorkspaceSettings ?? {}),
                 mode: issueExecutionWorkspaceModeForPersistedWorkspace(sourceWorkspace.mode),
               };
             }
           }
+        }
+        if (isolatedWorkspacesEnabled && requestedWorkspaceReuse && !executionWorkspaceId) {
+          throw unprocessable(
+            "reuse_existing requires an explicit executionWorkspaceId or an inherited source issue with an active execution workspace",
+          );
         }
         if (issueData.projectId == null && projectWorkspaceId) {
           const workspace = await assertValidProjectWorkspace(companyId, null, projectWorkspaceId, tx);
