@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
+  createChildIssueSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
   resolveIssueRecoveryActionSchema,
@@ -90,6 +91,27 @@ describe("issue validators", () => {
         resourceControl: { actionClass: "external_action", resourceKey: "" },
       },
     }).success).toBe(false);
+  });
+
+  it("preserves an explicit workspace inheritance source for review child issues", () => {
+    const sourceIssueId = "80f04971-ed4f-4d8e-95c8-6a7d8a9ae3b4";
+    const parsed = createChildIssueSchema.parse({
+      title: "Review unpublished implementation",
+      inheritExecutionWorkspaceFromIssueId: sourceIssueId,
+      blockedByIssueIds: [sourceIssueId],
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        resourceControl: {
+          actionClass: "review",
+          resourceKey: "worktree:paperclip/GLA-1505",
+        },
+      },
+    });
+
+    expect(parsed.inheritExecutionWorkspaceFromIssueId).toBe(sourceIssueId);
+    expect(parsed.blockedByIssueIds).toEqual([sourceIssueId]);
+    expect(parsed.executionWorkspacePreference).toBe("reuse_existing");
   });
 
   it("allows false-positive recovery resolutions to atomically restore the source issue status", () => {

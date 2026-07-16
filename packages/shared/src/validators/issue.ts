@@ -444,7 +444,6 @@ export type UpsertIssueWatchdog = z.infer<typeof upsertIssueWatchdogSchema>;
 export const createChildIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema
   .omit({
     parentId: true,
-    inheritExecutionWorkspaceFromIssueId: true,
     watchdogDiscovery: true,
   })
   .extend({
