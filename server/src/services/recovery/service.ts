@@ -5360,7 +5360,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // releaseIssueExecutionAndPromote / clearCheckoutRunIfTerminal / adoption.
   // Idempotent and safe: clears at most one row's worth of lock columns per
   // candidate, and only when the referenced run row is unambiguously terminal.
-  async function sweepStaleIssueLocks() {
+  async function sweepStaleIssueLocks(opts?: { issueCreatedAtGte?: Date | null }) {
     const result = {
       cleared: 0,
       issueIds: [] as string[],
@@ -5375,7 +5375,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       })
       .from(issues)
       .where(
-        sql`(${issues.checkoutRunId} is not null or ${issues.executionRunId} is not null)`,
+        and(
+          sql`(${issues.checkoutRunId} is not null or ${issues.executionRunId} is not null)`,
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+        ),
       );
 
     const referencedRunIds = [

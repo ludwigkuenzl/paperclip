@@ -6999,7 +6999,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
-  async function tickDueIssueMonitors(now = new Date()) {
+  async function tickDueIssueMonitors(now = new Date(), issueCreatedAtGte: Date | null = null) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
@@ -7013,6 +7013,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isNull(issues.assigneeUserId),
           sql`${issues.assigneeAgentId} is not null`,
           inArray(issues.status, ["in_progress", "in_review"]),
+          issueCreatedAtGte ? gte(issues.createdAt, issueCreatedAtGte) : undefined,
           or(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -7041,6 +7042,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               isNull(issues.assigneeUserId),
               sql`${issues.assigneeAgentId} is not null`,
               inArray(issues.status, ["in_progress", "in_review"]),
+              issueCreatedAtGte ? gte(issues.createdAt, issueCreatedAtGte) : undefined,
               or(
                 isNull(issues.monitorWakeRequestedAt),
                 lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -11876,7 +11878,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function sweepStaleIssueLocks() {
-    return recovery.sweepStaleIssueLocks();
+    return recovery.sweepStaleIssueLocks({ issueCreatedAtGte: await getAutomaticExecutionCutoff() });
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -11929,7 +11931,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reconcilePriorityDeliveryControl(opts?: { companyId?: string | null; now?: Date; limit?: number }) {
-    return reconcileDeliveryControlShadow(db, opts, { enqueueWakeup });
+    return reconcileDeliveryControlShadow(
+      db,
+      { ...opts, issueCreatedAtGte: await getAutomaticExecutionCutoff() },
+      { enqueueWakeup },
+    );
   }
 
   async function updateRuntimeState(
@@ -17537,7 +17543,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         else skipped += 1;
       }
 
-      const issueMonitors = await tickDueIssueMonitors(now);
+      const issueMonitors = await tickDueIssueMonitors(now, cutoff);
 
       return {
         checked: checked + issueMonitors.checked,

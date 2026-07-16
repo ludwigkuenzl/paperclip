@@ -469,7 +469,7 @@ type CandidateIssue = typeof issues.$inferSelect & { effectivePriority: IssuePri
 
 async function buildFairCandidatePool(
   db: Db,
-  opts: { companyId?: string | null; limit: number },
+  opts: { companyId?: string | null; limit: number; issueCreatedAtGte?: Date | null },
 ) {
   const graphIssues = await db
     .select()
@@ -479,6 +479,7 @@ async function buildFairCandidatePool(
       isNull(issues.hiddenAt),
       inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
       opts.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+      opts.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
     ));
   const graphIssueIds = new Set(graphIssues.map((issue) => issue.id));
   const relations = graphIssues.length === 0
@@ -1184,7 +1185,11 @@ async function resolveHealthyDeliveryRecovery(
   }));
 }
 
-async function resolveTerminalDeliveryRecoveries(db: Db, companyId?: string | null) {
+async function resolveTerminalDeliveryRecoveries(
+  db: Db,
+  companyId?: string | null,
+  issueCreatedAtGte?: Date | null,
+) {
   const terminalRows = await db
     .select({ actionId: issueRecoveryActions.id })
     .from(issueRecoveryActions)
@@ -1194,6 +1199,7 @@ async function resolveTerminalDeliveryRecoveries(db: Db, companyId?: string | nu
       inArray(issueRecoveryActions.cause, [DELIVERY_CONTROL_RECOVERY_CAUSE, DELIVERY_CONTROL_EXHAUSTED_CAUSE]),
       inArray(issues.status, ["done", "cancelled"]),
       companyId ? eq(issueRecoveryActions.companyId, companyId) : undefined,
+      issueCreatedAtGte ? gte(issues.createdAt, issueCreatedAtGte) : undefined,
     ));
   if (terminalRows.length === 0) return 0;
   await db
@@ -1211,7 +1217,7 @@ async function resolveTerminalDeliveryRecoveries(db: Db, companyId?: string | nu
 
 async function emitRecentTerminalAcceptances(
   db: Db,
-  input: { companyId?: string | null; now: Date; limit: number },
+  input: { companyId?: string | null; now: Date; limit: number; issueCreatedAtGte?: Date | null },
 ) {
   const broadCutoff = new Date(input.now.getTime() - 2 * 60 * 60 * 1000);
   const terminalRoots = await db
@@ -1226,6 +1232,7 @@ async function emitRecentTerminalAcceptances(
       isNotNull(issues.completedAt),
       gte(issues.completedAt, broadCutoff),
       input.companyId ? eq(issues.companyId, input.companyId) : undefined,
+      input.issueCreatedAtGte ? gte(issues.createdAt, input.issueCreatedAtGte) : undefined,
     ))
     .orderBy(desc(issues.completedAt), desc(issues.id))
     .limit(input.limit);
@@ -1246,12 +1253,16 @@ async function emitRecentTerminalAcceptances(
 
 export async function reconcileDeliveryControlShadow(
   db: Db,
-  opts: { companyId?: string | null; now?: Date; limit?: number } = {},
+  opts: { companyId?: string | null; now?: Date; limit?: number; issueCreatedAtGte?: Date | null } = {},
   deps?: DeliveryControlEnforcementDependencies,
 ) {
   const now = opts.now ?? new Date();
   const limit = Math.max(1, Math.min(DELIVERY_CONTROL_SCAN_LIMIT, Math.floor(opts.limit ?? DELIVERY_CONTROL_SCAN_LIMIT)));
-  const candidatePool = await buildFairCandidatePool(db, { companyId: opts.companyId, limit });
+  const candidatePool = await buildFairCandidatePool(db, {
+    companyId: opts.companyId,
+    limit,
+    issueCreatedAtGte: opts.issueCreatedAtGte,
+  });
   const candidates = candidatePool.candidates;
   let graphControls = { priorityPropagated: 0, incidentLaneFindings: 0 };
   try {
@@ -1278,11 +1289,16 @@ export async function reconcileDeliveryControlShadow(
     incidentLaneFindings: graphControls.incidentLaneFindings,
   };
   try {
-    result.terminalRecoveriesResolved = await resolveTerminalDeliveryRecoveries(db, opts.companyId);
+    result.terminalRecoveriesResolved = await resolveTerminalDeliveryRecoveries(
+      db,
+      opts.companyId,
+      opts.issueCreatedAtGte,
+    );
     result.terminalAcceptancesEmitted = await emitRecentTerminalAcceptances(db, {
       companyId: opts.companyId,
       now,
       limit,
+      issueCreatedAtGte: opts.issueCreatedAtGte,
     });
   } catch (error) {
     result.failed += 1;
