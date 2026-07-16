@@ -792,6 +792,31 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("allows a manager-chain agent to comment on a direct report's issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "backlog", assigneeAgentId: ownerAgentId }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment",
+      action: input.action,
+      reason: input.action === "issue:comment" ? "allow_manager_chain" : "deny_missing_grant",
+      explanation:
+        input.action === "issue:comment"
+          ? "Allowed because the actor manages the issue assignee in the reporting chain."
+          : "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Manager review activation is ready." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Manager review activation is ready.",
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
   it("rejects non-mentioned peer agents from posting comments", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:read",
@@ -1476,6 +1501,34 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows a manager-chain agent to activate a direct report's backlog issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "backlog", assigneeAgentId: ownerAgentId }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "backlog", assigneeAgentId: ownerAgentId }),
+      ...patch,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts",
+      action: input.action,
+      reason:
+        input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts"
+          ? "allow_manager_chain"
+          : "deny_missing_grant",
+      explanation:
+        input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts"
+          ? "Allowed because the actor manages the issue assignee in the reporting chain."
+          : "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
   });
 
   it.each([

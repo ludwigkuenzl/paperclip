@@ -1553,6 +1553,60 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.explanation).toContain("another company");
   });
 
+  it("allows direct and indirect managers to comment on and mutate an assignee's issue only inside their company", async () => {
+    const company = await createCompany(db, "ManagerIssueBoundary");
+    const foreignCompany = await createCompany(db, "ManagerIssueBoundaryForeign");
+    const seniorManager = await createAgent(db, company.id);
+    const directManager = await createAgent(db, company.id, { reportsTo: seniorManager.id });
+    const assignee = await createAgent(db, company.id, { reportsTo: directManager.id });
+    const peer = await createAgent(db, company.id);
+    const foreignManager = await createAgent(db, foreignCompany.id);
+    const issue = await createIssue(db, company.id, { assigneeAgentId: assignee.id });
+    const authz = authorizationService(db);
+    const resource = {
+      type: "issue" as const,
+      companyId: company.id,
+      issueId: issue.id,
+      assigneeAgentId: assignee.id,
+    };
+
+    for (const action of ["issue:comment", "issue:mutate"] as const) {
+      for (const manager of [directManager, seniorManager]) {
+        await expect(authz.decide({
+          actor: { type: "agent", agentId: manager.id, companyId: company.id, source: "agent_key" },
+          action,
+          resource,
+        })).resolves.toMatchObject({
+          allowed: true,
+          reason: "allow_manager_chain",
+        });
+      }
+
+      await expect(authz.decide({
+        actor: { type: "agent", agentId: peer.id, companyId: company.id, source: "agent_key" },
+        action,
+        resource,
+      })).resolves.toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
+
+      await expect(authz.decide({
+        actor: {
+          type: "agent",
+          agentId: foreignManager.id,
+          companyId: foreignCompany.id,
+          source: "agent_key",
+        },
+        action,
+        resource,
+      })).resolves.toMatchObject({
+        allowed: false,
+        reason: "deny_company_boundary",
+      });
+    }
+  });
+
   it("allows scoped assignment inside a granted project and denies other projects", async () => {
     const company = await createCompany(db, "ProjectScope");
     const project = await createProject(db, company.id, "Allowed");
