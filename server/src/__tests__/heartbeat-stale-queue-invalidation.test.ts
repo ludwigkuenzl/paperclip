@@ -374,8 +374,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         skipTimerWhenNoActionableWork: true,
       },
     });
+    const issueId = randomUUID();
     await db.insert(issues).values({
-      id: randomUUID(),
+      id: issueId,
       companyId,
       title: "Assigned work",
       status: "todo",
@@ -389,6 +390,12 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
 
     expect(run).not.toBeNull();
+    expect(run?.contextSnapshot).toMatchObject({
+      issueId,
+      taskId: issueId,
+      taskKey: issueId,
+      wakeSource: "timer",
+    });
     await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
 
     expect(countExecuteCallsForRun(run!.id)).toBe(1);

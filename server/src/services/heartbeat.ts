@@ -5461,6 +5461,20 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export function resolveAutomationIssueCreatedAtCutoff(
+  env: Record<string, string | undefined> = process.env,
+) {
+  const raw = env.PAPERCLIP_AUTOMATION_ISSUE_CREATED_AT_CUTOFF?.trim();
+  if (!raw) return null;
+  const cutoff = new Date(raw);
+  if (Number.isNaN(cutoff.getTime())) {
+    throw new Error(
+      "PAPERCLIP_AUTOMATION_ISSUE_CREATED_AT_CUTOFF must be a valid ISO-8601 timestamp",
+    );
+  }
+  return cutoff;
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -5468,6 +5482,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const runtimeEnv = options.runtimeEnv ?? process.env;
   const inWorktreeRuntime = isTruthyRuntimeEnvValue(runtimeEnv.PAPERCLIP_IN_WORKTREE);
+  const configuredAutomationCutoff = resolveAutomationIssueCreatedAtCutoff(runtimeEnv);
   // Preview worktree instances suppress the run engine by default. Users can lift
   // that per-worktree via the `enableWorktreeRunExecution` experimental setting
   // (worktree instances have their own isolated DB, so it can't affect the parent).
@@ -5509,9 +5524,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       allowWorktreeRunExecution: override.allowed,
     });
   };
-  const getWorktreeExecutionCutoff = async () => {
+  const getAutomaticExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
-    return override.allowed ? override.cutoff : null;
+    const worktreeCutoff = override.allowed ? override.cutoff : null;
+    if (!configuredAutomationCutoff) return worktreeCutoff;
+    if (!worktreeCutoff) return configuredAutomationCutoff;
+    return configuredAutomationCutoff > worktreeCutoff
+      ? configuredAutomationCutoff
+      : worktreeCutoff;
   };
 
   const runLogStore = getRunLogStore();
@@ -10288,7 +10308,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function promoteDueScheduledRetries(now = new Date()) {
-    const cutoff = await getWorktreeExecutionCutoff();
+    const cutoff = await getAutomaticExecutionCutoff();
     const dueRuns = await db
       .select()
       .from(heartbeatRuns)
@@ -10636,9 +10656,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
-  async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
-      .select({ id: issues.id })
+  async function resolveActionableTimerIssue(
+    agent: typeof agents.$inferSelect,
+    issueCreatedAtGte: Date | null = null,
+  ) {
+    return db
+      .select({
+        id: issues.id,
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+      })
       .from(issues)
       .where(
         and(
@@ -10647,11 +10674,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isNull(issues.assigneeUserId),
           isNull(issues.hiddenAt),
           inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+          issueCreatedAtGte ? gte(issues.createdAt, issueCreatedAtGte) : undefined,
         ),
+      )
+      .orderBy(
+        sql`case when ${issues.status} = 'in_progress' then 0 else 1 end`,
+        sql`case ${issues.priority}
+          when 'critical' then 0
+          when 'high' then 1
+          when 'medium' then 2
+          when 'low' then 3
+          else 4
+        end`,
+        asc(issues.updatedAt),
+        asc(issues.id),
       )
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+  }
+
+  async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
+    return Boolean(await resolveActionableTimerIssue(agent));
   }
 
   async function markTimerHeartbeatChecked(agentId: string, source: WakeupOptions["source"]) {
@@ -11810,7 +11853,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
-    const cutoff = await getWorktreeExecutionCutoff();
+    const cutoff = await getAutomaticExecutionCutoff();
 
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
@@ -11829,7 +11872,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reconcileStrandedAssignedIssues() {
-    return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getAutomaticExecutionCutoff() });
   }
 
   async function sweepStaleIssueLocks() {
@@ -11850,15 +11893,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
-    return recovery.scanSilentActiveRuns({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return recovery.scanSilentActiveRuns({ ...opts, issueCreatedAtGte: await getAutomaticExecutionCutoff() });
   }
 
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
-    return productivityReviews.reconcileProductivityReviews({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return productivityReviews.reconcileProductivityReviews({ ...opts, issueCreatedAtGte: await getAutomaticExecutionCutoff() });
   }
 
   async function reconcileTaskWatchdogs(opts?: { companyId?: string | null; runId?: string | null }) {
-    return taskWatchdogs.reconcileTaskWatchdogs({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return taskWatchdogs.reconcileTaskWatchdogs({ ...opts, issueCreatedAtGte: await getAutomaticExecutionCutoff() });
   }
 
   async function buildRunOutputSilence(
@@ -11882,7 +11925,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     now?: Date;
     reescalationCooldownMs?: number;
   }) {
-    return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getAutomaticExecutionCutoff() });
   }
 
   async function reconcilePriorityDeliveryControl(opts?: { companyId?: string | null; now?: Date; limit?: number }) {
@@ -11953,7 +11996,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
-    const cutoff = await getWorktreeExecutionCutoff();
+    const cutoff = await getAutomaticExecutionCutoff();
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -15515,7 +15558,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const worktreeExecutionCutoff = opts.requestedByActorType === "user"
       ? null
-      : await getWorktreeExecutionCutoff();
+      : await getAutomaticExecutionCutoff();
 
     const company = await db
       .select({ status: companies.status })
@@ -15532,6 +15575,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         error: `Wake suppressed because company status is ${companyStatus}`,
       });
       return null;
+    }
+
+    // Scheduled heartbeats historically had no issue context, so workspace
+    // resolution fell through to the empty agent fallback even when assigned
+    // work had an explicit project workspace. Bind a generic timer wake to one
+    // deterministic actionable issue before task/session/workspace resolution.
+    if (source === "timer" && !issueId) {
+      const timerIssue = await resolveActionableTimerIssue(agent, worktreeExecutionCutoff);
+      if (timerIssue) {
+        issueId = timerIssue.id;
+        enrichedContextSnapshot.issueId = timerIssue.id;
+        enrichedContextSnapshot.taskId = timerIssue.id;
+        enrichedContextSnapshot.taskKey = timerIssue.id;
+        if (timerIssue.projectId) enrichedContextSnapshot.projectId = timerIssue.projectId;
+        if (timerIssue.projectWorkspaceId) {
+          enrichedContextSnapshot.projectWorkspaceId = timerIssue.projectWorkspaceId;
+        }
+      }
     }
 
     const explicitResumeSession = await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
@@ -15570,7 +15631,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const continuationAttempt = readContinuationAttempt(enrichedContextSnapshot.livenessContinuationAttempt);
 
     let projectId = readNonEmptyString(enrichedContextSnapshot.projectId);
-    if (!projectId && issueId) {
+    if (issueId) {
       // Look up by either UUID or identifier (e.g. "ENV-13"), but always scope
       // by companyId so a row from another tenant can never be returned even
       // when identifiers collide across companies. Guard the UUID arm because
@@ -15587,6 +15648,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(issues.companyId, agent.companyId), idMatch))
         .then((rows) => rows[0] ?? null);
       if (resolvedIssue) {
+        // A production cutover cutoff is a hard freeze for older issues. Do
+        // not even append skipped wakeup audit rows: operators may require the
+        // complete pre-cutover task/run/wakeup state to remain byte-stable.
+        if (
+          opts.requestedByActorType !== "user" &&
+          configuredAutomationCutoff &&
+          resolvedIssue.createdAt < configuredAutomationCutoff
+        ) {
+          return null;
+        }
         if (worktreeExecutionCutoff && resolvedIssue.createdAt < worktreeExecutionCutoff) {
           await writeSkippedHeartbeatRequest("heartbeat.worktree_execution_cutoff", {
             reason: "worktree_execution_cutoff",
@@ -15595,7 +15666,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
           return null;
         }
-        projectId = resolvedIssue.projectId ?? null;
+        if (!projectId) projectId = resolvedIssue.projectId ?? null;
         // Canonicalize context to the UUID so downstream lookups always use UUID
         if (resolvedIssue.id !== issueId) {
           issueId = resolvedIssue.id;
@@ -17412,7 +17483,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           skipped: 0,
         };
       }
-      const cutoff = await getWorktreeExecutionCutoff();
+      const cutoff = await getAutomaticExecutionCutoff();
 
       const allAgents = await db
         .select({ ...getTableColumns(agents) })

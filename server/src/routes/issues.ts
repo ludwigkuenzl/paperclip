@@ -3209,6 +3209,8 @@ export function issueRoutes(
       companyId: string;
       status: string;
       assigneeUserId?: string | null;
+      createdByAgentId?: string | null;
+      parentId?: string | null;
       executionState?: unknown;
       monitorNextCheckAt?: Date | null;
     };
@@ -3245,6 +3247,21 @@ export function issueRoutes(
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
+
+    // A delegator is a real review owner when the executing agent returns the
+    // work. The update dispatcher below emits the matching reviewer wake.
+    if (
+      input.existing.createdByAgentId &&
+      input.existing.createdByAgentId !== input.actor.agentId
+    ) return;
+
+    if (input.existing.parentId) {
+      const parentReviewOwner = await svc.getById(input.existing.parentId);
+      if (
+        parentReviewOwner?.assigneeAgentId &&
+        parentReviewOwner.assigneeAgentId !== input.actor.agentId
+      ) return;
+    }
 
     const lifecycleMode = resolveIssueLifecycleEnforcementModeForCompany(input.existing.companyId);
     if (input.actor.actorType !== "agent" && lifecycleMode === "off") return;
@@ -8802,34 +8819,74 @@ export function issueRoutes(
 
       if (executionStageWakeup) {
         addWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup);
-      } else if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
-        addWakeup(issue.assigneeAgentId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "issue_assigned",
-          payload: {
-            issueId: issue.id,
-            ...(comment ? { commentId: comment.id } : {}),
-            mutation: "update",
-            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-            ...(interruptedRunId ? { interruptedRunId } : {}),
-          },
-          requestedByActorType: actor.actorType,
-          requestedByActorId: actor.actorId,
-          contextSnapshot: {
-            issueId: issue.id,
-            ...(comment
-              ? {
-                  taskId: issue.id,
-                  commentId: comment.id,
-                  wakeCommentId: comment.id,
-                }
-              : {}),
-            source: "issue.update",
-            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-            ...(interruptedRunId ? { interruptedRunId } : {}),
-          },
-        });
+      } else {
+        if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
+          addWakeup(issue.assigneeAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: {
+              issueId: issue.id,
+              ...(comment ? { commentId: comment.id } : {}),
+              mutation: "update",
+              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+              ...(interruptedRunId ? { interruptedRunId } : {}),
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: issue.id,
+              ...(comment
+                ? {
+                    taskId: issue.id,
+                    commentId: comment.id,
+                    wakeCommentId: comment.id,
+                  }
+                : {}),
+              source: "issue.update",
+              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+              ...(interruptedRunId ? { interruptedRunId } : {}),
+            },
+          });
+        }
+
+        const becameInReview = existing.status !== "in_review" && issue.status === "in_review";
+        if (becameInReview) {
+          const reviewerIds = new Set<string>();
+          if (issue.createdByAgentId) reviewerIds.add(issue.createdByAgentId);
+          if (issue.parentId) {
+            const parent = await svc.getById(issue.parentId);
+            if (parent?.assigneeAgentId) reviewerIds.add(parent.assigneeAgentId);
+          }
+          for (const reviewerAgentId of reviewerIds) {
+            if (reviewerAgentId === actor.agentId || reviewerAgentId === issue.assigneeAgentId) continue;
+            addWakeup(reviewerAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "execution_review_requested",
+              payload: {
+                issueId: issue.id,
+                mutation: "in_review",
+                ...(issue.parentId ? { parentIssueId: issue.parentId } : {}),
+              },
+              idempotencyKey: [
+                "execution_review_requested",
+                issue.id,
+                reviewerAgentId,
+                issue.updatedAt.toISOString(),
+              ].join(":"),
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: "execution_review_requested",
+                source: "issue.in_review_delegator",
+                ...(issue.parentId ? { parentIssueId: issue.parentId } : {}),
+              },
+            });
+          }
+        }
       }
 
       if (

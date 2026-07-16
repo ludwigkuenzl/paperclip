@@ -334,8 +334,13 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, participantAgentId));
-    expect(participantRuns).toHaveLength(1);
-    expect(participantRuns[0]?.errorCode).not.toBe("issue_assignee_changed");
+    expect(participantRuns).toContainEqual(expect.objectContaining({
+      contextSnapshot: expect.objectContaining({
+        issueId,
+        wakeReason: "execution_review_participant_recovery",
+      }),
+    }));
+    expect(participantRuns.every((run) => run.errorCode !== "issue_assignee_changed")).toBe(true);
   });
 
   it("lets the board trigger a scheduled issue monitor immediately", async () => {

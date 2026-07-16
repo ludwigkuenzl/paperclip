@@ -267,7 +267,8 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       source: "assignment",
       triggerDetail: "system",
       payload: { issueId },
-      contextSnapshot: { issueId },
+      // A caller-provided project must not bypass the issue-created-at guard.
+      contextSnapshot: { issueId, projectId: randomUUID() },
       requestedByActorType: "system",
     });
     expect(systemRun).toBeNull();
@@ -282,6 +283,36 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     expect(skippedWake?.payload).toMatchObject({
       heartbeatSkip: { reason: "worktree_execution_cutoff", issueId },
     });
+
+    const userRun = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "user",
+      payload: { issueId },
+      contextSnapshot: { issueId, skipIssueComment: true },
+      requestedByActorType: "user",
+      requestedByActorId: "operator",
+    });
+    expect(userRun).not.toBeNull();
+    await heartbeat.waitForRunExecutionDrain(userRun!.id);
+  }, 10_000);
+
+  it("preserves pre-cutover live issues from automation while allowing explicit board wakes", async () => {
+    const { agentId, issueId } = await insertAgentAndIssue();
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: {
+        PAPERCLIP_AUTOMATION_ISSUE_CREATED_AT_CUTOFF: new Date(Date.now() + 1_000).toISOString(),
+      },
+    });
+
+    const systemRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      payload: { issueId },
+      contextSnapshot: { issueId, projectId: randomUUID() },
+      requestedByActorType: "system",
+    });
+    expect(systemRun).toBeNull();
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
 
     const userRun = await heartbeat.wakeup(agentId, {
       source: "on_demand",
