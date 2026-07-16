@@ -19,11 +19,23 @@ function errorText(value: unknown): string {
   }
 }
 
+function taskStateTags(value: string) {
+  const tags: Array<{ id: string; state: string }> = [];
+  for (const match of value.matchAll(/<task\b[^>]*>/gi)) {
+    const tag = match[0];
+    const id = tag.match(/\bid=["']([^"']+)["']/i)?.[1]?.trim() ?? "";
+    const state = tag.match(/\bstate=["']([^"']+)["']/i)?.[1]?.trim().toLowerCase() ?? "";
+    if (id && state) tags.push({ id, state });
+  }
+  return tags;
+}
+
 export function parseOpenCodeJsonl(stdout: string) {
   let sessionId: string | null = null;
   const messages: string[] = [];
   const errors: string[] = [];
   const toolErrors: string[] = [];
+  const pendingBackgroundTasks = new Set<string>();
   const usage = {
     inputTokens: 0,
     cachedInputTokens: 0,
@@ -46,7 +58,14 @@ export function parseOpenCodeJsonl(stdout: string) {
     if (type === "text") {
       const part = parseObject(event.part);
       const text = asString(part.text, "").trim();
-      if (text) messages.push(text);
+      if (text) {
+        messages.push(text);
+        for (const task of taskStateTags(text)) {
+          if (task.state === "completed" || task.state === "error") {
+            pendingBackgroundTasks.delete(task.id);
+          }
+        }
+      }
       continue;
     }
 
@@ -64,6 +83,25 @@ export function parseOpenCodeJsonl(stdout: string) {
     if (type === "tool_use") {
       const part = parseObject(event.part);
       const state = parseObject(part.state);
+      const metadata = parseObject(state.metadata);
+      if (asString(part.tool, "") === "task" && metadata.background === true) {
+        const output = asString(state.output, "");
+        const tags = taskStateTags(output);
+        const runningTags = tags.filter((task) => task.state === "running");
+        for (const task of runningTags) pendingBackgroundTasks.add(task.id);
+        for (const task of tags) {
+          if (task.state === "completed" || task.state === "error") {
+            pendingBackgroundTasks.delete(task.id);
+          }
+        }
+        if (runningTags.length === 0 && tags.length === 0) {
+          const fallbackId =
+            asString(metadata.jobId, "").trim() ||
+            asString(metadata.sessionId, "").trim() ||
+            `unidentified:${currentSessionId || "background-task"}`;
+          pendingBackgroundTasks.add(fallbackId);
+        }
+      }
       if (asString(state.status, "") === "error") {
         const text = asString(state.error, "").trim();
         if (text) toolErrors.push(text);
@@ -85,6 +123,7 @@ export function parseOpenCodeJsonl(stdout: string) {
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
+    pendingBackgroundTasks: [...pendingBackgroundTasks].sort(),
   };
 }
 

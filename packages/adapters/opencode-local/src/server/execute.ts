@@ -37,6 +37,7 @@ import {
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
   renderPaperclipWakePrompt,
+  isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
@@ -64,6 +65,35 @@ function firstNonEmptyLine(text: string): string {
       .map((line) => line.trim())
       .find(Boolean) ?? ""
   );
+}
+
+export function classifyOpenCodeTerminalResult(input: {
+  rawExitCode: number | null;
+  parsedError: string;
+  stderr: string;
+  pendingBackgroundTasks: string[];
+}) {
+  const pendingChildrenError =
+    !input.parsedError &&
+    input.pendingBackgroundTasks.length > 0 &&
+    (input.rawExitCode ?? 0) === 0;
+  const pendingChildrenMessage = pendingChildrenError
+    ? `OpenCode exited while ${input.pendingBackgroundTasks.length} background task(s) were still pending: ${input.pendingBackgroundTasks.join(", ")}`
+    : "";
+  const exitCode =
+    (input.parsedError || pendingChildrenError) && (input.rawExitCode ?? 0) === 0
+      ? 1
+      : input.rawExitCode;
+  const errorMessage =
+    input.parsedError ||
+    pendingChildrenMessage ||
+    firstNonEmptyLine(input.stderr) ||
+    `OpenCode exited with code ${exitCode ?? -1}`;
+  return {
+    exitCode,
+    errorMessage: (exitCode ?? 0) === 0 ? null : errorMessage,
+    errorCode: pendingChildrenError ? "pending_children" : null,
+  };
 }
 
 function parseModelProvider(model: string | null): string | null {
@@ -545,7 +575,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
     const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-    const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
+    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+      ? ""
+      : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const prompt = joinPromptSections([
       instructionsPrefix,
@@ -652,20 +684,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
 
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
-      const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
       const rawExitCode = attempt.proc.exitCode;
-      const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
-      const fallbackErrorMessage =
-        parsedError ||
-        stderrLine ||
-        `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+      const terminal = classifyOpenCodeTerminalResult({
+        rawExitCode,
+        parsedError,
+        stderr: attempt.proc.stderr,
+        pendingBackgroundTasks: attempt.parsed.pendingBackgroundTasks,
+      });
       const modelId = model || null;
 
       return {
-        exitCode: synthesizedExitCode,
+        exitCode: terminal.exitCode,
         signal: attempt.proc.signal,
         timedOut: false,
-        errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorMessage: terminal.errorMessage,
+        errorCode: terminal.errorCode,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -682,6 +715,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
+          pendingBackgroundTasks: attempt.parsed.pendingBackgroundTasks,
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),

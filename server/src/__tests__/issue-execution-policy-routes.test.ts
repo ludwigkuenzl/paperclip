@@ -286,6 +286,59 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("wakes the delegator exactly once when delegated work moves to in_review", async () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const parentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const executorId = "33333333-3333-4333-8333-333333333333";
+    const delegatorId = "44444444-4444-4444-8444-444444444444";
+    const issue = {
+      id: issueId,
+      companyId: "company-1",
+      parentId,
+      status: "in_progress",
+      assigneeAgentId: executorId,
+      assigneeUserId: null,
+      createdByAgentId: delegatorId,
+      createdByUserId: null,
+      identifier: "PAP-1003",
+      title: "Delegated implementation",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockImplementation(async (id: string) => id === parentId
+      ? {
+          id: parentId,
+          companyId: "company-1",
+          status: "in_progress",
+          assigneeAgentId: delegatorId,
+        }
+      : issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date("2026-07-16T12:00:00.000Z"),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: executorId,
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      delegatorId,
+      expect.objectContaining({
+        reason: "execution_review_requested",
+        payload: expect.objectContaining({ issueId, parentIssueId: parentId }),
+      }),
+    );
+  });
+
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

@@ -1,6 +1,37 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ensureRemoteOpenCodeModelConfiguredAndAvailable } from "./execute.js";
+import {
+  classifyOpenCodeTerminalResult,
+  ensureRemoteOpenCodeModelConfiguredAndAvailable,
+} from "./execute.js";
+
+describe("classifyOpenCodeTerminalResult", () => {
+  it("turns a clean exit with pending background children into a non-success result", () => {
+    expect(classifyOpenCodeTerminalResult({
+      rawExitCode: 0,
+      parsedError: "",
+      stderr: "",
+      pendingBackgroundTasks: ["job-1", "job-2"],
+    })).toEqual({
+      exitCode: 1,
+      errorCode: "pending_children",
+      errorMessage: expect.stringContaining("job-1, job-2"),
+    });
+  });
+
+  it("keeps a clean exit successful when no background children are pending", () => {
+    expect(classifyOpenCodeTerminalResult({
+      rawExitCode: 0,
+      parsedError: "",
+      stderr: "",
+      pendingBackgroundTasks: [],
+    })).toEqual({
+      exitCode: 0,
+      errorCode: null,
+      errorMessage: null,
+    });
+  });
+});
 
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {

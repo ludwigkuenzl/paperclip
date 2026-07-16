@@ -267,7 +267,8 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       source: "assignment",
       triggerDetail: "system",
       payload: { issueId },
-      contextSnapshot: { issueId },
+      // A caller-provided project must not bypass the issue-created-at guard.
+      contextSnapshot: { issueId, projectId: randomUUID() },
       requestedByActorType: "system",
     });
     expect(systemRun).toBeNull();
@@ -294,6 +295,88 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     expect(userRun).not.toBeNull();
     await heartbeat.waitForRunExecutionDrain(userRun!.id);
   }, 10_000);
+
+  it("preserves pre-cutover live issues from automation while allowing explicit board wakes", async () => {
+    const { agentId, issueId } = await insertAgentAndIssue();
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: {
+        PAPERCLIP_AUTOMATION_ISSUE_CREATED_AT_CUTOFF: new Date(Date.now() + 1_000).toISOString(),
+      },
+    });
+
+    const systemRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      payload: { issueId },
+      contextSnapshot: { issueId, projectId: randomUUID() },
+      requestedByActorType: "system",
+    });
+    expect(systemRun).toBeNull();
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+
+    const userRun = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "user",
+      payload: { issueId },
+      contextSnapshot: { issueId, skipIssueComment: true },
+      requestedByActorType: "user",
+      requestedByActorId: "operator",
+    });
+    expect(userRun).not.toBeNull();
+    await heartbeat.waitForRunExecutionDrain(userRun!.id);
+  }, 10_000);
+
+  it("leaves pre-cutover issue maintenance state untouched", async () => {
+    const { companyId, agentId, issueId } = await insertAgentAndIssue();
+    const checkoutRunId = randomUUID();
+    const monitorNextCheckAt = new Date(Date.now() - 60_000);
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "user",
+      status: "completed",
+      responsibleUserId: "responsible-user",
+      startedAt: new Date(Date.now() - 120_000),
+      finishedAt: new Date(Date.now() - 90_000),
+    });
+    await db
+      .update(issues)
+      .set({
+        status: "in_progress",
+        checkoutRunId,
+        monitorNextCheckAt,
+        monitorWakeRequestedAt: null,
+      })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: {
+        PAPERCLIP_AUTOMATION_ISSUE_CREATED_AT_CUTOFF: new Date(Date.now() + 1_000).toISOString(),
+      },
+    });
+
+    expect(await heartbeat.sweepStaleIssueLocks()).toEqual({ cleared: 0, issueIds: [] });
+    expect((await heartbeat.reconcilePriorityDeliveryControl()).checked).toBe(0);
+    await heartbeat.tickTimers(new Date());
+
+    const [issue] = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issue).toEqual({
+      checkoutRunId,
+      monitorNextCheckAt,
+      monitorWakeRequestedAt: null,
+    });
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+  });
 
   it("still creates live-plane assignment runs when suppression is not active", async () => {
     const { agentId, issueId } = await insertAgentAndIssue();

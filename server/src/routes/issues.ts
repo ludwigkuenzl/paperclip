@@ -27,6 +27,7 @@ import {
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
+  companySearchExtractQuerySchema,
   companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
@@ -64,6 +65,8 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   type CompactIssue,
+  type CompanySearchExtractQuery,
+  type CompanySearchExtractResponse,
   type CompanySearchQuery,
   type CompanySearchResponse,
   type ExecutionWorkspace,
@@ -256,6 +259,7 @@ type RecoveryRevalidationTrigger =
   | "work_product"
   | "read_projection";
 type CompanySearchService = {
+  extract(companyId: string, query: CompanySearchExtractQuery): Promise<CompanySearchExtractResponse>;
   search(companyId: string, query: CompanySearchQuery): Promise<CompanySearchResponse>;
 };
 type ActivityIssueRelationSummary = {
@@ -2563,6 +2567,10 @@ export function issueRoutes(
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
     taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
+    recoveryActionEnqueueWakeup?: (
+      agentId: string,
+      options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
+    ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
     issueListDiagnostics?: IssueListDiagnostics;
     approveToolActionRequest?: (input: {
       companyId: string;
@@ -2579,6 +2587,7 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
   let searchSvc = opts.searchService ?? null;
@@ -3200,6 +3209,8 @@ export function issueRoutes(
       companyId: string;
       status: string;
       assigneeUserId?: string | null;
+      createdByAgentId?: string | null;
+      parentId?: string | null;
       executionState?: unknown;
       monitorNextCheckAt?: Date | null;
     };
@@ -3236,6 +3247,21 @@ export function issueRoutes(
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
+
+    // A delegator is a real review owner when the executing agent returns the
+    // work. The update dispatcher below emits the matching reviewer wake.
+    if (
+      input.existing.createdByAgentId &&
+      input.existing.createdByAgentId !== input.actor.agentId
+    ) return;
+
+    if (input.existing.parentId) {
+      const parentReviewOwner = await svc.getById(input.existing.parentId);
+      if (
+        parentReviewOwner?.assigneeAgentId &&
+        parentReviewOwner.assigneeAgentId !== input.actor.agentId
+      ) return;
+    }
 
     const lifecycleMode = resolveIssueLifecycleEnforcementModeForCompany(input.existing.companyId);
     if (input.actor.actorType !== "agent" && lifecycleMode === "off") return;
@@ -4754,6 +4780,40 @@ export function issueRoutes(
     });
   });
 
+  router.get("/companies/:companyId/search/extract", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const companyScopeDecision = await access.decide({
+      actor: req.actor,
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    });
+    if (!companyScopeDecision.allowed) {
+      res.status(403).json({ error: "Company search is outside this actor's authorization boundary" });
+      return;
+    }
+    const parsedQuery = companySearchExtractQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error: parsedQuery.error.issues[0]?.message ?? "Invalid extract search query",
+      });
+      return;
+    }
+    const rateLimit = searchRateLimiter.consume(companySearchRateLimitActor(req, companyId));
+    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+      res.status(429).json({
+        error: "Search rate limit exceeded",
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      });
+      return;
+    }
+    const result = await getSearchService().extract(companyId, parsedQuery.data);
+    res.json(result);
+  });
+
   router.get("/companies/:companyId/search", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -5698,6 +5758,14 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
+    const handBackAgentId = outcome === "restored" && sourceIssueStatus === "todo"
+      ? activeRecoveryAction?.returnOwnerAgentId ?? null
+      : null;
+    const recordedOutcome = handBackAgentId
+      ? "handed_back"
+      : outcome === "restored" && sourceIssueStatus === "done"
+        ? "owner_completed"
+        : outcome;
     const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
     await assertInReviewReviewPath({
       existing,
@@ -5737,6 +5805,7 @@ export function issueRoutes(
           id,
           {
             status: sourceIssueStatus,
+            ...(handBackAgentId ? { assigneeAgentId: handBackAgentId } : {}),
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
             lifecycleTransitionContext: { activeRecoveryResolution: true },
@@ -5753,7 +5822,7 @@ export function issueRoutes(
           sourceIssueId: existing.id,
           actionId: actionId ?? null,
           status: actionStatus,
-          outcome,
+          outcome: recordedOutcome,
           resolutionNote: resolutionNote ?? null,
         },
         tx,
@@ -5808,32 +5877,36 @@ export function issueRoutes(
 
     if (
       sourceIssueStatus === "todo" &&
-      existing.status !== result.issue.status &&
-      result.issue.assigneeAgentId
+      result.issue.assigneeAgentId &&
+      (existing.status !== result.issue.status ||
+        existing.assigneeAgentId !== result.issue.assigneeAgentId)
     ) {
-      void heartbeat.wakeup(result.issue.assigneeAgentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "issue_recovery_action_restored",
-        payload: {
-          issueId: result.issue.id,
-          recoveryActionId: result.recoveryAction.id,
-          mutation: "recovery_action_resolution",
-        },
-        requestedByActorType: actor.actorType,
-        requestedByActorId: actor.actorId,
-        contextSnapshot: {
-          issueId: result.issue.id,
-          taskId: result.issue.id,
-          wakeReason: "issue_recovery_action_restored",
-          source: "issue.recovery_action_resolution",
-          recoveryActionId: result.recoveryAction.id,
-        },
-      }).catch((err) =>
+      try {
+        await enqueueRecoveryActionWakeup(result.issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_recovery_action_restored",
+          payload: {
+            issueId: result.issue.id,
+            recoveryActionId: result.recoveryAction.id,
+            mutation: "recovery_action_resolution",
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: result.issue.id,
+            taskId: result.issue.id,
+            wakeReason: "issue_recovery_action_restored",
+            source: "issue.recovery_action_resolution",
+            recoveryActionId: result.recoveryAction.id,
+          },
+        });
+      } catch (err) {
         logger.warn(
           { err, issueId: result.issue.id, agentId: result.issue.assigneeAgentId },
           "failed to wake agent after recovery action restored issue",
-        ));
+        );
+      }
     }
 
     res.json({
@@ -7144,10 +7217,12 @@ export function issueRoutes(
       projectId: createBody.projectId ?? null,
       executionPolicy,
     }, actor);
+    let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
     const issue = await svc.create(companyId, {
       ...createBody,
       ...(taskBridgeOriginForActor(req) ?? {}),
       id: issueId,
+      originRunId: createBody.originRunId ?? actor.runId,
       executionPolicy,
       ...(sourceTrust ? { sourceTrust } : {}),
       createdByAgentId: actor.agentId,
@@ -7156,7 +7231,21 @@ export function issueRoutes(
       actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
       trustExplicitResponsibleUserId: actor.actorType === "user",
       watchdogActorRunId: actor.runId,
+      onDeduplicated: (reason) => {
+        deduplicationReason = reason;
+      },
     });
+    if (deduplicationReason) {
+      const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+      res.status(200).json({
+        ...issue,
+        deduplicated: true,
+        deduplicationReason,
+        relatedWork: referenceSummary,
+        referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
+      });
+      return;
+    }
     await logCreateLifecycleShadowFinding({ issue, actor, violation: createLifecycleViolation });
     await issueReferencesSvc.syncIssue(issue.id);
     await externalObjectsSvc.syncIssueSafely(issue.id);
@@ -8730,34 +8819,74 @@ export function issueRoutes(
 
       if (executionStageWakeup) {
         addWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup);
-      } else if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
-        addWakeup(issue.assigneeAgentId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "issue_assigned",
-          payload: {
-            issueId: issue.id,
-            ...(comment ? { commentId: comment.id } : {}),
-            mutation: "update",
-            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-            ...(interruptedRunId ? { interruptedRunId } : {}),
-          },
-          requestedByActorType: actor.actorType,
-          requestedByActorId: actor.actorId,
-          contextSnapshot: {
-            issueId: issue.id,
-            ...(comment
-              ? {
-                  taskId: issue.id,
-                  commentId: comment.id,
-                  wakeCommentId: comment.id,
-                }
-              : {}),
-            source: "issue.update",
-            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-            ...(interruptedRunId ? { interruptedRunId } : {}),
-          },
-        });
+      } else {
+        if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
+          addWakeup(issue.assigneeAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: {
+              issueId: issue.id,
+              ...(comment ? { commentId: comment.id } : {}),
+              mutation: "update",
+              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+              ...(interruptedRunId ? { interruptedRunId } : {}),
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: issue.id,
+              ...(comment
+                ? {
+                    taskId: issue.id,
+                    commentId: comment.id,
+                    wakeCommentId: comment.id,
+                  }
+                : {}),
+              source: "issue.update",
+              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+              ...(interruptedRunId ? { interruptedRunId } : {}),
+            },
+          });
+        }
+
+        const becameInReview = existing.status !== "in_review" && issue.status === "in_review";
+        if (becameInReview) {
+          const reviewerIds = new Set<string>();
+          if (issue.createdByAgentId) reviewerIds.add(issue.createdByAgentId);
+          if (issue.parentId) {
+            const parent = await svc.getById(issue.parentId);
+            if (parent?.assigneeAgentId) reviewerIds.add(parent.assigneeAgentId);
+          }
+          for (const reviewerAgentId of reviewerIds) {
+            if (reviewerAgentId === actor.agentId || reviewerAgentId === issue.assigneeAgentId) continue;
+            addWakeup(reviewerAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "execution_review_requested",
+              payload: {
+                issueId: issue.id,
+                mutation: "in_review",
+                ...(issue.parentId ? { parentIssueId: issue.parentId } : {}),
+              },
+              idempotencyKey: [
+                "execution_review_requested",
+                issue.id,
+                reviewerAgentId,
+                issue.updatedAt.toISOString(),
+              ].join(":"),
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: "execution_review_requested",
+                source: "issue.in_review_delegator",
+                ...(issue.parentId ? { parentIssueId: issue.parentId } : {}),
+              },
+            });
+          }
+        }
       }
 
       if (
