@@ -19,8 +19,11 @@ import { queryKeys } from "../lib/queryKeys";
 import { orderReusableExecutionWorkspaces } from "../lib/reusable-execution-workspaces";
 import {
   defaultExecutionWorkspaceModeForProject,
+  defaultExecutionWorkspaceSelectionForProject,
   defaultProjectWorkspaceIdForProject,
+  executionWorkspaceSelectionLabel,
   issueExecutionWorkspaceModeForExistingWorkspace,
+  projectLocksExecutionWorkspaceSelection,
 } from "../lib/project-workspace-defaults";
 import { useProjectOrder } from "../hooks/useProjectOrder";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
@@ -102,6 +105,7 @@ interface IssueDraft {
   assigneeThinkingEffort: string;
   assigneeChrome: boolean;
   executionWorkspaceMode?: string;
+  executionWorkspaceModeSemantics?: "inherit_v1";
   selectedExecutionWorkspaceId?: string;
   useIsolatedExecutionWorkspace?: boolean;
   workMode?: IssueWorkMode;
@@ -278,8 +282,9 @@ const priorities = [
 ];
 
 const EXECUTION_WORKSPACE_MODES = [
-  { value: "shared_workspace", label: "Project default" },
+  { value: "inherit", label: "Project default" },
   { value: "isolated_workspace", label: "New isolated workspace" },
+  { value: "shared_workspace", label: "Shared workspace" },
   { value: "reuse_existing", label: "Reuse existing workspace" },
 ] as const;
 
@@ -295,7 +300,7 @@ function defaultExecutionWorkspaceModeForIssueDefaults(
   }
   return typeof defaults.executionWorkspaceMode === "string" && defaults.executionWorkspaceMode.length > 0
     ? defaults.executionWorkspaceMode
-    : defaultExecutionWorkspaceModeForProject(project);
+    : defaultExecutionWorkspaceSelectionForProject(project);
 }
 
 function isWorkModePeriodShortcut(e: Pick<React.KeyboardEvent, "code" | "ctrlKey" | "key" | "metaKey">) {
@@ -444,7 +449,7 @@ export function NewIssueDialog() {
   const [assigneeModelOverride, setAssigneeModelOverride] = useState("");
   const [assigneeThinkingEffort, setAssigneeThinkingEffort] = useState("");
   const [assigneeChrome, setAssigneeChrome] = useState(false);
-  const [executionWorkspaceMode, setExecutionWorkspaceMode] = useState<string>("shared_workspace");
+  const [executionWorkspaceMode, setExecutionWorkspaceMode] = useState<string>("inherit");
   const [selectedExecutionWorkspaceId, setSelectedExecutionWorkspaceId] = useState("");
   const [workMode, setWorkMode] = useState<IssueWorkMode>("standard");
   const [expanded, setExpanded] = useState(false);
@@ -679,6 +684,7 @@ export function NewIssueDialog() {
       assigneeThinkingEffort,
       assigneeChrome,
       executionWorkspaceMode,
+      executionWorkspaceModeSemantics: "inherit_v1",
       selectedExecutionWorkspaceId,
       workMode,
     });
@@ -843,8 +849,10 @@ export function NewIssueDialog() {
         hasExplicitExecutionWorkspaceId || hasExplicitExecutionWorkspaceMode
           ? defaultExecutionWorkspaceModeForIssueDefaults(newIssueDefaults, restoredProject)
           : (
-              draft.executionWorkspaceMode
-              ?? (draft.useIsolatedExecutionWorkspace ? "isolated_workspace" : defaultExecutionWorkspaceModeForProject(restoredProject))
+              (draft.executionWorkspaceMode === "shared_workspace" && draft.executionWorkspaceModeSemantics !== "inherit_v1"
+                ? "inherit"
+                : draft.executionWorkspaceMode)
+              ?? (draft.useIsolatedExecutionWorkspace ? "isolated_workspace" : defaultExecutionWorkspaceSelectionForProject(restoredProject))
             ),
       );
       setWorkMode(nextWorkMode);
@@ -941,7 +949,7 @@ export function NewIssueDialog() {
     setAssigneeModelOverride("");
     setAssigneeThinkingEffort("");
     setAssigneeChrome(false);
-    setExecutionWorkspaceMode("shared_workspace");
+    setExecutionWorkspaceMode("inherit");
     setSelectedExecutionWorkspaceId("");
     setWorkMode("standard");
     setExpanded(false);
@@ -971,7 +979,7 @@ export function NewIssueDialog() {
     setAssigneeModelOverride("");
     setAssigneeThinkingEffort("");
     setAssigneeChrome(false);
-    setExecutionWorkspaceMode("shared_workspace");
+    setExecutionWorkspaceMode("inherit");
     setSelectedExecutionWorkspaceId("");
     setWorkMode("standard");
   }
@@ -1003,13 +1011,16 @@ export function NewIssueDialog() {
       experimentalSettings?.enableIsolatedWorkspaces === true
         ? selectedProject?.executionWorkspacePolicy ?? null
         : null;
+    const effectiveExecutionWorkspaceSelection = projectLocksExecutionWorkspaceSelection(selectedProject)
+      ? "inherit"
+      : executionWorkspaceMode;
     const selectedReusableExecutionWorkspace = selectableReusableWorkspaces.find(
       (workspace) => workspace.id === selectedExecutionWorkspaceId,
     );
     const requestedExecutionWorkspaceMode =
-      executionWorkspaceMode === "reuse_existing"
+      effectiveExecutionWorkspaceSelection === "reuse_existing"
         ? issueExecutionWorkspaceModeForExistingWorkspace(selectedReusableExecutionWorkspace?.mode)
-        : executionWorkspaceMode;
+        : effectiveExecutionWorkspaceSelection;
     const executionWorkspaceSettings = executionWorkspacePolicy?.enabled
       ? { mode: requestedExecutionWorkspaceMode }
       : null;
@@ -1032,8 +1043,8 @@ export function NewIssueDialog() {
       ...(projectId ? { projectId } : {}),
       ...(projectWorkspaceId ? { projectWorkspaceId } : {}),
       ...(assigneeAdapterOverrides ? { assigneeAdapterOverrides } : {}),
-      ...(executionWorkspacePolicy?.enabled ? { executionWorkspacePreference: executionWorkspaceMode } : {}),
-      ...(executionWorkspaceMode === "reuse_existing" && selectedExecutionWorkspaceId
+      ...(executionWorkspacePolicy?.enabled ? { executionWorkspacePreference: effectiveExecutionWorkspaceSelection } : {}),
+      ...(effectiveExecutionWorkspaceSelection === "reuse_existing" && selectedExecutionWorkspaceId
         ? { executionWorkspaceId: selectedExecutionWorkspaceId }
         : {}),
       ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
@@ -1142,13 +1153,17 @@ export function NewIssueDialog() {
       ? currentProject?.executionWorkspacePolicy ?? null
       : null;
   const currentProjectSupportsExecutionWorkspace = Boolean(currentProjectExecutionWorkspacePolicy?.enabled);
+  const currentProjectLocksExecutionWorkspace = projectLocksExecutionWorkspaceSelection(currentProject);
+  const effectiveExecutionWorkspaceMode = currentProjectLocksExecutionWorkspace
+    ? "inherit"
+    : executionWorkspaceMode;
   const taskWatchdogsEnabled = experimentalSettings?.enableTaskWatchdogs === true;
   const selectableReusableWorkspaces = reusableExecutionWorkspaces ?? [];
   const selectedReusableExecutionWorkspace = selectableReusableWorkspaces.find(
     (workspace) => workspace.id === selectedExecutionWorkspaceId,
   );
   const isUsingParentExecutionWorkspace = isSubIssueMode && parentExecutionWorkspaceId
-    ? executionWorkspaceMode === "reuse_existing" && selectedExecutionWorkspaceId === parentExecutionWorkspaceId
+    ? effectiveExecutionWorkspaceMode === "reuse_existing" && selectedExecutionWorkspaceId === parentExecutionWorkspaceId
     : false;
   const showParentWorkspaceWarning = isSubIssueMode
     && currentProjectSupportsExecutionWorkspace
@@ -1225,7 +1240,7 @@ export function NewIssueDialog() {
     const nextProject = orderedProjects.find((project) => project.id === nextProjectId);
     executionWorkspaceDefaultProjectId.current = nextProjectId || null;
     setProjectWorkspaceId(defaultProjectWorkspaceIdForProject(nextProject));
-    setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForProject(nextProject));
+    setExecutionWorkspaceMode(defaultExecutionWorkspaceSelectionForProject(nextProject));
     setSelectedExecutionWorkspaceId("");
   }, [orderedProjects]);
 
@@ -1242,7 +1257,7 @@ export function NewIssueDialog() {
     if (!project) return;
     executionWorkspaceDefaultProjectId.current = projectId;
     setProjectWorkspaceId(defaultProjectWorkspaceIdForProject(project));
-    setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForProject(project));
+    setExecutionWorkspaceMode(defaultExecutionWorkspaceSelectionForProject(project));
     setSelectedExecutionWorkspaceId("");
   }, [newIssueOpen, orderedProjects, projectId, selectedExecutionWorkspaceId]);
   const modelOverrideOptions = useMemo<InlineEntityOption[]>(
@@ -1799,11 +1814,11 @@ export function NewIssueDialog() {
             <div className="space-y-1.5">
               <div className="text-xs font-medium">Execution workspace</div>
               <div className="text-(length:--text-micro) text-muted-foreground">
-                Control whether this task runs in the shared workspace, a new isolated workspace, or an existing one.
+                Use the project default, start a new workspace, or reuse an existing one.
               </div>
               <select
                 className="w-full rounded border border-border bg-transparent px-2 py-1.5 text-xs outline-none"
-                value={executionWorkspaceMode}
+                value={effectiveExecutionWorkspaceMode}
                 onChange={(e) => {
                   setExecutionWorkspaceMode(e.target.value);
                   if (e.target.value !== "reuse_existing") {
@@ -1811,13 +1826,24 @@ export function NewIssueDialog() {
                   }
                 }}
               >
-                {EXECUTION_WORKSPACE_MODES.map((option) => (
+                {EXECUTION_WORKSPACE_MODES
+                  .filter((option) => !currentProjectLocksExecutionWorkspace || option.value === "inherit")
+                  .map((option) => (
                   <option key={option.value} value={option.value}>
-                    {option.label}
+                    {option.value === "inherit"
+                      ? `${option.label} (${executionWorkspaceSelectionLabel(defaultExecutionWorkspaceModeForProject(currentProject))})`
+                      : option.label}
                   </option>
-                ))}
+                  ))}
               </select>
-              {executionWorkspaceMode === "reuse_existing" && (
+              {effectiveExecutionWorkspaceMode === "inherit" && (
+                <div className="text-(length:--text-micro) text-muted-foreground">
+                  {currentProjectLocksExecutionWorkspace
+                    ? "This project enforces its workspace policy for every task."
+                    : "This task follows the project policy automatically, including future policy changes before its first run."}
+                </div>
+              )}
+              {effectiveExecutionWorkspaceMode === "reuse_existing" && (
                 <ReusableExecutionWorkspaceSelect
                   value={selectedExecutionWorkspaceId}
                   workspaces={selectableReusableWorkspaces}
@@ -1827,7 +1853,7 @@ export function NewIssueDialog() {
                   disablePortal
                 />
               )}
-              {executionWorkspaceMode === "reuse_existing" && selectedReusableExecutionWorkspace && (
+              {effectiveExecutionWorkspaceMode === "reuse_existing" && selectedReusableExecutionWorkspace && (
                 <div className="text-(length:--text-micro) text-muted-foreground">
                   Reusing {selectedReusableExecutionWorkspace.name} from {selectedReusableExecutionWorkspace.branchName ?? selectedReusableExecutionWorkspace.cwd ?? "existing execution workspace"}.
                 </div>

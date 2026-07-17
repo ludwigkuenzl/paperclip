@@ -4,6 +4,7 @@ type ProjectWorkspaceDefaultSource = {
   workspaces?: Array<{ id: string; isPrimary: boolean }>;
   executionWorkspacePolicy?: {
     enabled?: boolean;
+    allowIssueOverride?: boolean;
     defaultMode?: ProjectExecutionWorkspaceDefaultMode | string | null;
     defaultProjectWorkspaceId?: string | null;
   } | null;
@@ -27,6 +28,26 @@ export function defaultExecutionWorkspaceModeForProject(project: ProjectWorkspac
     return defaultMode === "adapter_default" ? "agent_default" : defaultMode;
   }
   return "shared_workspace";
+}
+
+export function defaultExecutionWorkspaceSelectionForProject(
+  project: ProjectWorkspaceDefaultSource,
+): ExecutionWorkspaceMode {
+  return project?.executionWorkspacePolicy?.enabled ? "inherit" : defaultExecutionWorkspaceModeForProject(project);
+}
+
+export function projectLocksExecutionWorkspaceSelection(project: ProjectWorkspaceDefaultSource) {
+  return project?.executionWorkspacePolicy?.enabled === true
+    && project.executionWorkspacePolicy.allowIssueOverride === false;
+}
+
+export function executionWorkspaceSelectionLabel(mode: ExecutionWorkspaceMode) {
+  if (mode === "isolated_workspace") return "New isolated workspace";
+  if (mode === "operator_branch") return "Operator branch";
+  if (mode === "agent_default") return "Agent default";
+  if (mode === "reuse_existing") return "Reuse existing workspace";
+  if (mode === "inherit") return "Project default";
+  return "Shared workspace";
 }
 
 export function issueExecutionWorkspaceModeForExistingWorkspace(

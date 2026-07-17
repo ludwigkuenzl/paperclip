@@ -64,6 +64,25 @@ describe("pipeline automation issue title templates", () => {
     });
   });
 
+  it("preserves project-default inheritance in stage automation", () => {
+    expect(
+      buildStageAutomationForSave({
+        assigneeAgentId: "agent-1",
+        titleTemplate: "Run {{case_key}}",
+        instructionsBody: "Follow the project policy.",
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        executionWorkspaceId: "",
+        executionWorkspacePreference: "inherit",
+        executionWorkspaceSettings: { mode: "inherit" },
+      }),
+    ).toMatchObject({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: "inherit",
+      executionWorkspaceSettings: { mode: "inherit" },
+    });
+  });
+
   it("detects variables from the issue title template and instructions", () => {
     const variables = syncPipelineStageAutomationVariables(
       "{{pipeline_name}} / {{stage_name}}: {{case_title}} for {{market}}",

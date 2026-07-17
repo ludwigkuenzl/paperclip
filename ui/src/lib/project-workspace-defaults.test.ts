@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   defaultExecutionWorkspaceModeForProject,
+  defaultExecutionWorkspaceSelectionForProject,
   defaultProjectWorkspaceIdForProject,
+  executionWorkspaceSelectionLabel,
   issueExecutionWorkspaceModeForExistingWorkspace,
+  projectLocksExecutionWorkspaceSelection,
 } from "./project-workspace-defaults";
 
 describe("project workspace defaults", () => {
@@ -38,5 +41,27 @@ describe("project workspace defaults", () => {
 
     expect(issueExecutionWorkspaceModeForExistingWorkspace("cloud_sandbox")).toBe("agent_default");
     expect(issueExecutionWorkspaceModeForExistingWorkspace("isolated_workspace")).toBe("isolated_workspace");
+  });
+
+  it("represents an enabled project policy as inheritance in issue controls", () => {
+    const project = {
+      executionWorkspacePolicy: { enabled: true, defaultMode: "isolated_workspace" },
+    };
+
+    expect(defaultExecutionWorkspaceSelectionForProject(project)).toBe("inherit");
+    expect(executionWorkspaceSelectionLabel(defaultExecutionWorkspaceModeForProject(project)))
+      .toBe("New isolated workspace");
+  });
+
+  it("identifies projects that disallow issue-level workspace choices", () => {
+    expect(projectLocksExecutionWorkspaceSelection({
+      executionWorkspacePolicy: { enabled: true, allowIssueOverride: false },
+    })).toBe(true);
+    expect(projectLocksExecutionWorkspaceSelection({
+      executionWorkspacePolicy: { enabled: true, allowIssueOverride: true },
+    })).toBe(false);
+    expect(projectLocksExecutionWorkspaceSelection({
+      executionWorkspacePolicy: { enabled: false, allowIssueOverride: false },
+    })).toBe(false);
   });
 });

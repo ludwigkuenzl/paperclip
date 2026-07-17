@@ -3321,6 +3321,23 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   };
 }
 
+export function shouldReplaceIncompatibleLockedProjectWorkspaceReuse(input: {
+  projectPolicyLocked: boolean;
+  requestedShouldReuseExisting: boolean;
+  requestedMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
+  requestedStrategyType: string;
+  existingWorkspace: Pick<ExecutionWorkspace, "mode" | "strategyType"> | null;
+  workspaceConfigFreshnessAction: WorkspaceConfigFreshnessDecisionAction;
+}) {
+  if (!input.projectPolicyLocked || !input.requestedShouldReuseExisting) return false;
+  if (!input.existingWorkspace) return true;
+  if (issueExecutionWorkspaceModeForPersistedWorkspace(input.existingWorkspace.mode) !== input.requestedMode) {
+    return true;
+  }
+  if (input.existingWorkspace.strategyType !== input.requestedStrategyType) return true;
+  return input.workspaceConfigFreshnessAction === "replace";
+}
+
 export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
   requestedShouldReuseExisting: boolean;
   workspaceConfigFreshness: ExecutionWorkspaceConfigFreshnessDecision;
@@ -12468,11 +12485,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
     });
-    const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
-    const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
+    const projectPolicyLocksIssueWorkspaceOverrides =
+      projectExecutionWorkspacePolicy?.enabled === true &&
+      projectExecutionWorkspacePolicy.allowIssueOverride === false;
+    let requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
+    let requestedExecutionWorkspaceIdForProvisioning = workspaceReuseRequest.requestedExecutionWorkspaceId;
+    let reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
       ? existingExecutionWorkspace
       : null;
-    const requestedReusableExecutionWorkspaceConfig = reusableExistingExecutionWorkspace?.config ?? null;
+    let supersededExecutionWorkspace: ExecutionWorkspace | null = null;
     const localEnvironment = await environmentsSvc.ensureLocalEnvironment(agent.companyId);
     const resolvedInstanceSettings = await instanceSettings.get();
     const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
@@ -12676,7 +12697,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
-    const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
+    const sessionWorkspaceStrategyType = resolveEffectiveWorkspaceStrategyType(
+      requestedExecutionWorkspaceMode,
+      mergedConfig,
+    );
+    const lockedReuseRejectedForSession = shouldReplaceIncompatibleLockedProjectWorkspaceReuse({
+      projectPolicyLocked: projectPolicyLocksIssueWorkspaceOverrides,
+      requestedShouldReuseExisting,
+      requestedMode: requestedExecutionWorkspaceMode,
+      requestedStrategyType: sessionWorkspaceStrategyType,
+      existingWorkspace: reusableExistingExecutionWorkspace,
+      workspaceConfigFreshnessAction: "reuse",
+    });
+    const sessionReusableExecutionWorkspace = lockedReuseRejectedForSession
+      ? null
+      : reusableExistingExecutionWorkspace;
+    const sessionIssueExecutionWorkspaceSettings = projectPolicyLocksIssueWorkspaceOverrides
+      ? issueExecutionWorkspaceSettings?.resourceControl
+        ? { resourceControl: issueExecutionWorkspaceSettings.resourceControl }
+        : null
+      : issueExecutionWorkspaceSettings;
+    const buildSessionConfigMetadata = (sessionWorkspace: ExecutionWorkspace | null) =>
+      buildEffectiveRunSessionConfigMetadata({
       adapterType: agent.adapterType,
       effectiveAdapterConfig: runtimeConfig,
       agentRuntimeConfig: agent.runtimeConfig,
@@ -12692,18 +12734,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? projectContext.updatedAt.toISOString()
           : projectContext?.updatedAt ?? null,
         projectPolicy: projectExecutionWorkspacePolicy,
-        issueSettings: issueExecutionWorkspaceSettings,
-        reusableExecutionWorkspaceConfig: requestedReusableExecutionWorkspaceConfig,
-        existingExecutionWorkspace: reusableExistingExecutionWorkspace
+        issueSettings: sessionIssueExecutionWorkspaceSettings,
+        reusableExecutionWorkspaceConfig: sessionWorkspace?.config ?? null,
+        existingExecutionWorkspace: sessionWorkspace
           ? {
-              id: reusableExistingExecutionWorkspace.id,
-              mode: reusableExistingExecutionWorkspace.mode,
-              strategyType: reusableExistingExecutionWorkspace.strategyType,
-              projectWorkspaceId: reusableExistingExecutionWorkspace.projectWorkspaceId,
-              repoUrl: reusableExistingExecutionWorkspace.repoUrl,
-              baseRef: reusableExistingExecutionWorkspace.baseRef,
-              branchName: reusableExistingExecutionWorkspace.branchName,
-              config: reusableExistingExecutionWorkspace.config,
+              id: sessionWorkspace.id,
+              mode: sessionWorkspace.mode,
+              strategyType: sessionWorkspace.strategyType,
+              projectWorkspaceId: sessionWorkspace.projectWorkspaceId,
+              repoUrl: sessionWorkspace.repoUrl,
+              baseRef: sessionWorkspace.baseRef,
+              branchName: sessionWorkspace.branchName,
+              config: sessionWorkspace.config,
             }
           : null,
       },
@@ -12735,6 +12777,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : null,
     });
+    let sessionConfigMetadata = await buildSessionConfigMetadata(sessionReusableExecutionWorkspace);
     const configuredModel = readConfiguredModelFromAdapterConfig(runtimeConfig);
     const wakeSessionResetReason = describeSessionResetReason(context);
     const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
@@ -12873,12 +12916,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           evaluatedAt: latestWorkspaceConfigMetadata.evaluatedAt,
         })
       : null;
-    const workspaceConfigFreshness = resolveExecutionWorkspaceConfigFreshness({
+    let workspaceConfigFreshness = resolveExecutionWorkspaceConfigFreshness({
       hasExistingWorkspace: requestedShouldReuseExisting && Boolean(reusableExistingExecutionWorkspace),
       existingWorkspaceMetadata: reusableExistingExecutionWorkspace?.metadata ?? null,
       inferredMetadata: inferredExistingWorkspaceConfigMetadata,
       nextMetadata: latestWorkspaceConfigMetadata,
     });
+    const replaceLockedProjectWorkspaceReuse = shouldReplaceIncompatibleLockedProjectWorkspaceReuse({
+      projectPolicyLocked: projectPolicyLocksIssueWorkspaceOverrides,
+      requestedShouldReuseExisting,
+      requestedMode: requestedExecutionWorkspaceMode,
+      requestedStrategyType: latestWorkspaceStrategyType,
+      existingWorkspace: reusableExistingExecutionWorkspace,
+      workspaceConfigFreshnessAction: workspaceConfigFreshness.action,
+    });
+    if (replaceLockedProjectWorkspaceReuse) {
+      logger.warn(
+        {
+          runId: run.id,
+          issueId,
+          requestedExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          requestedExecutionWorkspaceMode,
+          requestedStrategyType: latestWorkspaceStrategyType,
+          existingWorkspaceMode: reusableExistingExecutionWorkspace?.mode ?? null,
+          existingWorkspaceStrategyType: reusableExistingExecutionWorkspace?.strategyType ?? null,
+          workspaceConfigFreshnessAction: workspaceConfigFreshness.action,
+        },
+        "Ignoring incompatible execution workspace reuse because the project policy disables issue overrides",
+      );
+      supersededExecutionWorkspace = reusableExistingExecutionWorkspace;
+      requestedShouldReuseExisting = false;
+      requestedExecutionWorkspaceIdForProvisioning = null;
+      reusableExistingExecutionWorkspace = null;
+      workspaceConfigFreshness = resolveExecutionWorkspaceConfigFreshness({
+        hasExistingWorkspace: false,
+        existingWorkspaceMetadata: null,
+        inferredMetadata: null,
+        nextMetadata: latestWorkspaceConfigMetadata,
+      });
+      if (sessionReusableExecutionWorkspace) {
+        sessionConfigMetadata = await buildSessionConfigMetadata(null);
+      }
+    }
     const workspaceReuseProvisioningPolicy = resolveExecutionWorkspaceReuseProvisioningPolicy({
       requestedShouldReuseExisting,
       workspaceConfigFreshness,
@@ -12887,14 +12966,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: agent.companyId,
       heartbeatRunId: run.id,
       executionWorkspaceId: workspaceReuseProvisioningPolicy.shouldRestoreExistingWorkspace
-        ? workspaceReuseRequest.requestedExecutionWorkspaceId
+        ? requestedExecutionWorkspaceIdForProvisioning
         : null,
       issueId,
     });
     const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
       await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
         requestedShouldReuseExisting,
-        existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+        existingExecutionWorkspaceId: requestedExecutionWorkspaceIdForProvisioning,
         issueRef,
         runId: run.id,
         workspaceConfigFreshness,
@@ -13023,7 +13102,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             workspace: {
               id:
                 reusableExistingExecutionWorkspace?.id
-                ?? workspaceReuseRequest.requestedExecutionWorkspaceId
+                ?? requestedExecutionWorkspaceIdForProvisioning
                 ?? `transient-${run.id}`,
               cwd: executionWorkspace.cwd,
               providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
@@ -13073,13 +13152,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       previousWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
       activeWorkspaceId: persistedExecutionWorkspace?.id ?? null,
     });
+    const replacedExecutionWorkspace = reusableExistingExecutionWorkspace ?? supersededExecutionWorkspace;
     if (
-      reusableExistingExecutionWorkspace &&
+      replacedExecutionWorkspace &&
       persistedExecutionWorkspace &&
-      reusableExistingExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
-      reusableExistingExecutionWorkspace.status === "active"
+      replacedExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
+      replacedExecutionWorkspace.status === "active"
     ) {
-      await executionWorkspacesSvc.update(reusableExistingExecutionWorkspace.id, {
+      await executionWorkspacesSvc.update(replacedExecutionWorkspace.id, {
         status: "idle",
         cleanupReason: null,
       });
@@ -13390,7 +13470,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         taskSessionAvailable: taskSession != null,
         taskSessionReused: taskSessionForRun != null,
         storedFingerprintPresent: Boolean(sessionConfigFreshness.storedFingerprint),
-        nextFingerprint: sessionConfigFreshness.nextFingerprint,
+        nextFingerprint: sessionConfigMetadata.fingerprint,
       },
       workspace: {
         fingerprintVersion: latestWorkspaceConfigMetadata.version,

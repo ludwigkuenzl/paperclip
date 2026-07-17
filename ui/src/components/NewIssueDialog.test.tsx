@@ -685,6 +685,119 @@ describe("NewIssueDialog", () => {
     act(() => root.unmount());
   });
 
+  it("submits project default as inheritance instead of a shared workspace override", async () => {
+    mockProjectsApi.list.mockResolvedValue([
+      {
+        id: "project-1",
+        name: "Alpha",
+        description: null,
+        archivedAt: null,
+        color: "#445566",
+        workspaces: [
+          {
+            id: "project-workspace-1",
+            name: "Primary",
+            isPrimary: true,
+          },
+        ],
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+        },
+      },
+    ]);
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: true });
+    dialogState.newIssueDefaults = {
+      title: "Follow project workspace policy",
+      projectId: "project-1",
+    };
+
+    const { root } = renderDialog(container);
+    await flush();
+
+    const workspaceSelect = Array.from(container.querySelectorAll("select"))
+      .find((select) => Array.from(select.options).some((option) => option.textContent?.includes("Project default")));
+    await waitForAssertion(() => {
+      expect(workspaceSelect?.value).toBe("inherit");
+      expect(workspaceSelect?.textContent).toContain("Project default (New isolated workspace)");
+      expect(workspaceSelect?.textContent).not.toContain("Shared workspace");
+      expect(workspaceSelect?.textContent).not.toContain("Reuse existing workspace");
+    });
+
+    const submitButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Create Task"));
+    expect(submitButton).not.toBeUndefined();
+    await waitForAssertion(() => {
+      expect(submitButton?.hasAttribute("disabled")).toBe(false);
+    });
+
+    await act(async () => {
+      submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    expect(mockIssuesApi.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        title: "Follow project workspace policy",
+        projectId: "project-1",
+        executionWorkspacePreference: "inherit",
+        executionWorkspaceSettings: { mode: "inherit" },
+      }),
+    );
+
+    act(() => root.unmount());
+  });
+
+  it.each([
+    { name: "migrates a legacy Project default draft", semantics: undefined, expected: "inherit" },
+    { name: "preserves a new explicit Shared workspace draft", semantics: "inherit_v1", expected: "shared_workspace" },
+  ])("$name", async ({ semantics, expected }) => {
+    mockProjectsApi.list.mockResolvedValue([
+      {
+        id: "project-1",
+        name: "Alpha",
+        description: null,
+        archivedAt: null,
+        color: "#445566",
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+        },
+      },
+    ]);
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: true });
+    localStorage.setItem("paperclip:issue-draft", JSON.stringify({
+      title: "Workspace draft",
+      description: "",
+      status: "todo",
+      priority: "medium",
+      assigneeValue: "",
+      reviewerValue: "",
+      approverValue: "",
+      projectId: "project-1",
+      assigneeModelLane: "primary",
+      assigneeModelOverride: "",
+      assigneeThinkingEffort: "",
+      assigneeChrome: false,
+      executionWorkspaceMode: "shared_workspace",
+      ...(semantics ? { executionWorkspaceModeSemantics: semantics } : {}),
+      workMode: "standard",
+    }));
+
+    const { root } = renderDialog(container);
+    await flush();
+
+    const workspaceSelect = Array.from(container.querySelectorAll("select"))
+      .find((select) => Array.from(select.options).some((option) => option.textContent?.includes("Project default")));
+    await waitForAssertion(() => {
+      expect(workspaceSelect?.value).toBe(expected);
+    });
+
+    act(() => root.unmount());
+  });
+
   it("keeps the reusable workspace search popover inside the modal", async () => {
     mockProjectsApi.list.mockResolvedValue([
       {

@@ -94,8 +94,11 @@ import { getRecentAssigneeIds, sortAgentsByRecency } from "../lib/recent-assigne
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
 import {
   defaultExecutionWorkspaceModeForProject,
+  defaultExecutionWorkspaceSelectionForProject,
   defaultProjectWorkspaceIdForProject,
+  executionWorkspaceSelectionLabel,
   issueExecutionWorkspaceModeForExistingWorkspace,
+  projectLocksExecutionWorkspaceSelection,
 } from "../lib/project-workspace-defaults";
 import { orderReusableExecutionWorkspaces } from "../lib/reusable-execution-workspaces";
 import { cn, relativeTime } from "../lib/utils";
@@ -310,8 +313,9 @@ function stageConfig(stage: PipelineStage | null | undefined): StageConfig {
 }
 
 const STAGE_EXECUTION_WORKSPACE_OPTIONS = [
-  { value: "shared_workspace", label: "Project default" },
+  { value: "inherit", label: "Project default" },
   { value: "isolated_workspace", label: "New isolated workspace" },
+  { value: "shared_workspace", label: "Shared workspace" },
   { value: "reuse_existing", label: "Reuse existing workspace" },
 ] as const;
 
@@ -1562,6 +1566,12 @@ export function PipelineSettings() {
   const selectedProjectSupportsExecutionWorkspace =
     experimentalSettingsQuery.data?.enableIsolatedWorkspaces === true
     && Boolean(selectedAutomationProject?.executionWorkspacePolicy?.enabled);
+  const selectedProjectLocksExecutionWorkspace =
+    selectedProjectSupportsExecutionWorkspace
+    && projectLocksExecutionWorkspaceSelection(selectedAutomationProject);
+  const effectiveStageExecutionWorkspacePreference = selectedProjectLocksExecutionWorkspace
+    ? "inherit"
+    : stageExecutionWorkspacePreference;
   const reusableExecutionWorkspacesQuery = useQuery({
     queryKey: selectedCompanyId && stageProjectId
       ? queryKeys.executionWorkspaces.summaryList(selectedCompanyId, {
@@ -1580,7 +1590,7 @@ export function PipelineSettings() {
       Boolean(selectedCompanyId) &&
       Boolean(stageProjectId) &&
       selectedProjectSupportsExecutionWorkspace &&
-      stageExecutionWorkspacePreference === "reuse_existing",
+      effectiveStageExecutionWorkspacePreference === "reuse_existing",
   });
   const deduplicatedReusableWorkspaces = useMemo<ExecutionWorkspaceSummary[]>(
     () => orderReusableExecutionWorkspaces(reusableExecutionWorkspacesQuery.data ?? []),
@@ -1706,7 +1716,7 @@ export function PipelineSettings() {
       setStageProjectWorkspaceId(defaultProjectWorkspaceIdForProject(selectedAutomationProject));
     }
     if (!stageExecutionWorkspacePreference) {
-      setStageExecutionWorkspacePreference(defaultExecutionWorkspaceModeForProject(selectedAutomationProject));
+      setStageExecutionWorkspacePreference(defaultExecutionWorkspaceSelectionForProject(selectedAutomationProject));
     }
   }, [
     selectedAutomationProject,
@@ -1772,7 +1782,7 @@ export function PipelineSettings() {
       if (
         stageProjectId &&
         selectedProjectSupportsExecutionWorkspace &&
-        stageExecutionWorkspacePreference === "reuse_existing" &&
+        effectiveStageExecutionWorkspacePreference === "reuse_existing" &&
         !stageExecutionWorkspaceId
       ) {
         throw new Error("Choose an existing workspace before saving this stage.");
@@ -1791,7 +1801,7 @@ export function PipelineSettings() {
           projectId: stageProjectId,
           projectWorkspaceId: stageProjectWorkspaceId,
           executionWorkspaceId: stageExecutionWorkspaceId,
-          executionWorkspacePreference: stageExecutionWorkspacePreference,
+          executionWorkspacePreference: effectiveStageExecutionWorkspacePreference,
           executionWorkspaceSettings: currentAutomationExecutionWorkspaceSettings,
         }),
         requireApproval: nextRequiresApproval,
@@ -2082,7 +2092,7 @@ export function PipelineSettings() {
     const nextProject = orderedProjects.find((project) => project.id === nextProjectId);
     setStageProjectId(nextProjectId);
     setStageProjectWorkspaceId(defaultProjectWorkspaceIdForProject(nextProject));
-    setStageExecutionWorkspacePreference(nextProject ? defaultExecutionWorkspaceModeForProject(nextProject) : "");
+    setStageExecutionWorkspacePreference(nextProject ? defaultExecutionWorkspaceSelectionForProject(nextProject) : "");
     setStageExecutionWorkspaceId("");
     setStageExecutionWorkspaceSettings(null);
   };
@@ -2146,15 +2156,17 @@ export function PipelineSettings() {
   const isReviewStage = stageKind === "review";
   const defaultAutoAdvanceStage = nextStageByPosition(stages, selectedStage) ?? otherStages[0] ?? null;
   const currentAutomationExecutionWorkspaceSettings =
-    stageProjectId && stageExecutionWorkspacePreference
+    stageProjectId && effectiveStageExecutionWorkspacePreference
       ? (
-          stageExecutionWorkspaceSettings
-          ?? executionWorkspaceSettingsForPreference(stageExecutionWorkspacePreference, selectedReusableExecutionWorkspace)
+          selectedProjectLocksExecutionWorkspace
+            ? executionWorkspaceSettingsForPreference("inherit", null)
+            : stageExecutionWorkspaceSettings
+              ?? executionWorkspaceSettingsForPreference(effectiveStageExecutionWorkspacePreference, selectedReusableExecutionWorkspace)
         )
       : null;
   const canSaveAutomationWorkspace =
     !selectedProjectSupportsExecutionWorkspace ||
-    stageExecutionWorkspacePreference !== "reuse_existing" ||
+    effectiveStageExecutionWorkspacePreference !== "reuse_existing" ||
     Boolean(stageExecutionWorkspaceId);
 
   const savedStageForm = selectedStage
@@ -2188,8 +2200,8 @@ export function PipelineSettings() {
         automationProjectId: stageProjectId,
         automationProjectWorkspaceId: stageProjectId ? stageProjectWorkspaceId : "",
         automationExecutionWorkspaceId:
-          stageProjectId && stageExecutionWorkspacePreference === "reuse_existing" ? stageExecutionWorkspaceId : "",
-        automationExecutionWorkspacePreference: stageProjectId ? stageExecutionWorkspacePreference : "",
+          stageProjectId && effectiveStageExecutionWorkspacePreference === "reuse_existing" ? stageExecutionWorkspaceId : "",
+        automationExecutionWorkspacePreference: stageProjectId ? effectiveStageExecutionWorkspacePreference : "",
         automationExecutionWorkspaceSettings: currentAutomationExecutionWorkspaceSettings,
         automationTitleTemplate: pipelineAutomationTitleTemplate(issueTitleTemplate),
       }
@@ -3010,17 +3022,21 @@ export function PipelineSettings() {
                                 <div className="grid gap-2 sm:grid-cols-(--gtc-43)">
                                   <select
                                     aria-label="Execution workspace mode"
-                                    value={stageExecutionWorkspacePreference || "shared_workspace"}
+                                    value={effectiveStageExecutionWorkspacePreference || "inherit"}
                                     onChange={(event) => handleAutomationExecutionWorkspacePreferenceChange(event.target.value)}
                                     className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                                   >
-                                    {STAGE_EXECUTION_WORKSPACE_OPTIONS.map((option) => (
+                                    {STAGE_EXECUTION_WORKSPACE_OPTIONS
+                                      .filter((option) => !selectedProjectLocksExecutionWorkspace || option.value === "inherit")
+                                      .map((option) => (
                                       <option key={option.value} value={option.value}>
-                                        {option.label}
+                                        {option.value === "inherit"
+                                          ? `${option.label} (${executionWorkspaceSelectionLabel(defaultExecutionWorkspaceModeForProject(selectedAutomationProject))})`
+                                          : option.label}
                                       </option>
-                                    ))}
+                                      ))}
                                   </select>
-                                  {stageExecutionWorkspacePreference === "reuse_existing" ? (
+                                  {effectiveStageExecutionWorkspacePreference === "reuse_existing" ? (
                                     <select
                                       aria-label="Existing execution workspace"
                                       value={stageExecutionWorkspaceId}
@@ -3036,13 +3052,20 @@ export function PipelineSettings() {
                                     </select>
                                   ) : (
                                     <div className="flex h-10 items-center rounded-md border border-dashed border-border px-3 text-sm text-muted-foreground">
-                                      {stageExecutionWorkspacePreference === "isolated_workspace"
+                                      {effectiveStageExecutionWorkspacePreference === "isolated_workspace"
                                         ? "A new workspace will be created"
-                                        : "Project default workspace"}
+                                        : effectiveStageExecutionWorkspacePreference === "inherit"
+                                          ? `Project default: ${executionWorkspaceSelectionLabel(defaultExecutionWorkspaceModeForProject(selectedAutomationProject))}`
+                                          : executionWorkspaceSelectionLabel(effectiveStageExecutionWorkspacePreference || "inherit")}
                                     </div>
                                   )}
                                 </div>
-                                {stageExecutionWorkspacePreference === "reuse_existing" && selectedReusableExecutionWorkspace ? (
+                                {selectedProjectLocksExecutionWorkspace ? (
+                                  <p className="mt-2 text-xs text-muted-foreground">
+                                    This project enforces its workspace policy for every automated task.
+                                  </p>
+                                ) : null}
+                                {effectiveStageExecutionWorkspacePreference === "reuse_existing" && selectedReusableExecutionWorkspace ? (
                                   <p className="mt-2 text-xs text-muted-foreground">
                                     Reusing {selectedReusableExecutionWorkspace.name} from {selectedReusableExecutionWorkspace.branchName ?? selectedReusableExecutionWorkspace.cwd ?? "existing workspace"}.
                                   </p>
