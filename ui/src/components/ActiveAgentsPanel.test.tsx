@@ -162,6 +162,33 @@ describe("ActiveAgentsPanel", () => {
     });
   });
 
+  it("renders a queued run as waiting without live wording", async () => {
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([
+      { ...createRun(1), status: "queued", startedAt: null },
+    ]);
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ActiveAgentsPanel companyId="company-1" />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("Queued");
+    expect(container.textContent).not.toContain("Live now");
+    expect(container.querySelector('[data-testid="run-queue-wait-badge"]')?.className).toContain("amber");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("can request the full live dashboard page limit without a hidden-runs link", async () => {
     const root = createRoot(container);
     const queryClient = new QueryClient({

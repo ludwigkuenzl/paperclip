@@ -9,7 +9,10 @@ import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import {
   defaultExecutionWorkspaceModeForProject,
+  defaultExecutionWorkspaceSelectionForProject,
+  executionWorkspaceSelectionLabel,
   issueExecutionWorkspaceModeForExistingWorkspace,
+  projectLocksExecutionWorkspaceSelection,
 } from "../lib/project-workspace-defaults";
 import { orderReusableExecutionWorkspaces } from "../lib/reusable-execution-workspaces";
 import { cn, projectWorkspaceUrl } from "../lib/utils";
@@ -23,8 +26,9 @@ import { Badge } from "@/components/ui/badge";
 /* -------------------------------------------------------------------------- */
 
 const EXECUTION_WORKSPACE_OPTIONS = [
-  { value: "shared_workspace", label: "Project default" },
+  { value: "inherit", label: "Project default" },
   { value: "isolated_workspace", label: "New isolated workspace" },
+  { value: "shared_workspace", label: "Shared workspace" },
   { value: "reuse_existing", label: "Reuse existing workspace" },
 ] as const;
 
@@ -103,8 +107,12 @@ function configuredWorkspaceLabel(
   reusableWorkspace: ExecutionWorkspace | null,
 ) {
   switch (selection) {
+    case "inherit":
+      return "Project default";
     case "isolated_workspace":
       return "New isolated workspace";
+    case "shared_workspace":
+      return "Shared workspace";
     case "reuse_existing":
       return reusableWorkspace?.mode === "isolated_workspace"
         ? "Existing isolated workspace"
@@ -175,6 +183,7 @@ interface IssueWorkspaceCardProps {
     id: string;
     executionWorkspacePolicy?: {
       enabled?: boolean;
+      allowIssueOverride?: boolean;
       defaultMode?: string | null;
       defaultProjectWorkspaceId?: string | null;
       environmentId?: string | null;
@@ -213,6 +222,7 @@ export function IssueWorkspaceCard({
   const environmentsEnabled = experimentalSettings?.enableEnvironments === true;
   const policyEnabled = experimentalSettings?.enableIsolatedWorkspaces === true
     && Boolean(project?.executionWorkspacePolicy?.enabled);
+  const policyLocked = projectLocksExecutionWorkspaceSelection(project);
 
   const workspace = issue.currentExecutionWorkspace as ExecutionWorkspace | null | undefined;
   const { data: environments } = useQuery({
@@ -237,7 +247,7 @@ export function IssueWorkspaceCard({
         projectWorkspaceId: issue.projectWorkspaceId ?? undefined,
         reuseEligible: true,
       }),
-    enabled: Boolean(companyId) && Boolean(issue.projectId) && editing,
+    enabled: Boolean(companyId) && Boolean(issue.projectId) && editing && !policyLocked,
   });
 
   const selectableReusableWorkspaces = reusableExecutionWorkspaces ?? [];
@@ -247,12 +257,14 @@ export function IssueWorkspaceCard({
     ?? workspace
     ?? null;
 
-  const currentSelection = shouldPresentExistingWorkspaceSelection(issue)
+  const currentSelection = policyLocked
+    ? "inherit"
+    : shouldPresentExistingWorkspaceSelection(issue)
     ? "reuse_existing"
     : (
         issue.executionWorkspacePreference
         ?? issue.executionWorkspaceSettings?.mode
-        ?? defaultExecutionWorkspaceModeForProject(project)
+        ?? defaultExecutionWorkspaceSelectionForProject(project)
       );
 
   const [draftSelection, setDraftSelection] = useState(currentSelection);
@@ -295,26 +307,27 @@ export function IssueWorkspaceCard({
     workspace,
   });
 
-  const canSaveWorkspaceConfig = draftSelection !== "reuse_existing" || draftExecutionWorkspaceId.length > 0;
+  const effectiveDraftSelection = policyLocked ? "inherit" : draftSelection;
+  const canSaveWorkspaceConfig = effectiveDraftSelection !== "reuse_existing" || draftExecutionWorkspaceId.length > 0;
   const draftWorkspaceBranchName =
-    draftSelection === "reuse_existing" && configuredReusableWorkspace?.mode !== "shared_workspace"
+    effectiveDraftSelection === "reuse_existing" && configuredReusableWorkspace?.mode !== "shared_workspace"
       ? configuredReusableWorkspace?.branchName ?? null
       : null;
 
   const buildWorkspaceDraftUpdate = useCallback(() => ({
-    executionWorkspacePreference: draftSelection,
-    executionWorkspaceId: draftSelection === "reuse_existing" ? draftExecutionWorkspaceId || null : null,
+    executionWorkspacePreference: effectiveDraftSelection,
+    executionWorkspaceId: effectiveDraftSelection === "reuse_existing" ? draftExecutionWorkspaceId || null : null,
     executionWorkspaceSettings: {
       mode:
-        draftSelection === "reuse_existing"
+        effectiveDraftSelection === "reuse_existing"
           ? issueExecutionWorkspaceModeForExistingWorkspace(configuredReusableWorkspace?.mode)
-          : draftSelection,
+          : effectiveDraftSelection,
       environmentId: null,
     },
   }), [
     configuredReusableWorkspace?.mode,
     draftExecutionWorkspaceId,
-    draftSelection,
+    effectiveDraftSelection,
   ]);
 
   useEffect(() => {
@@ -462,7 +475,7 @@ export function IssueWorkspaceCard({
         <div className="space-y-2 pt-1">
           <select
             className="w-full rounded border border-border bg-transparent px-2 py-1.5 text-xs outline-none"
-            value={draftSelection}
+            value={effectiveDraftSelection}
             onChange={(e) => {
               const nextMode = e.target.value;
               setDraftSelection(nextMode);
@@ -473,16 +486,26 @@ export function IssueWorkspaceCard({
               }
             }}
           >
-            {EXECUTION_WORKSPACE_OPTIONS.map((option) => (
+            {EXECUTION_WORKSPACE_OPTIONS
+              .filter((option) => !policyLocked || option.value === "inherit")
+              .map((option) => (
               <option key={option.value} value={option.value}>
-                {option.value === "reuse_existing" && configuredReusableWorkspace?.mode === "isolated_workspace"
-                  ? "Existing isolated workspace"
-                  : option.label}
+                {option.value === "inherit"
+                  ? `${option.label} (${executionWorkspaceSelectionLabel(defaultExecutionWorkspaceModeForProject(project))})`
+                  : option.value === "reuse_existing" && configuredReusableWorkspace?.mode === "isolated_workspace"
+                    ? "Existing isolated workspace"
+                    : option.label}
               </option>
-            ))}
+              ))}
           </select>
 
-          {draftSelection === "reuse_existing" && (
+          {policyLocked ? (
+            <div className="text-(length:--text-micro) text-muted-foreground">
+              This project enforces its workspace policy for every task.
+            </div>
+          ) : null}
+
+          {effectiveDraftSelection === "reuse_existing" && (
             <ReusableExecutionWorkspaceSelect
               value={draftExecutionWorkspaceId}
               workspaces={selectableReusableWorkspaces}

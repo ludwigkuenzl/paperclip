@@ -324,6 +324,47 @@ describe("buildAssistantPartsFromTranscript", () => {
 });
 
 describe("buildIssueChatMessages", () => {
+  it("represents queued work as a distinct waiting message, never running or finished", () => {
+    const messages = buildIssueChatMessages({
+      comments: [],
+      timelineEvents: [],
+      linkedRuns: [],
+      liveRuns: [
+        {
+          id: "run-queued",
+          status: "queued",
+          invocationSource: "assignment",
+          triggerDetail: null,
+          startedAt: null,
+          finishedAt: null,
+          createdAt: "2026-07-15T10:00:00.000Z",
+          agentId: "agent-1",
+          agentName: "CodexCoder",
+          adapterType: "codex_local",
+        },
+      ],
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      id: "run-assistant:run-queued",
+      role: "assistant",
+      status: { type: "complete", reason: "unknown" },
+      metadata: {
+        custom: {
+          kind: "queued-run",
+          runStatus: "queued",
+          waitingText: "Waiting to start…",
+        },
+      },
+    });
+    expect(JSON.stringify(messages[0])).not.toContain("Run finished");
+    const queuedMessage = messages[0];
+    expect(queuedMessage?.role).toBe("assistant");
+    if (queuedMessage?.role !== "assistant") throw new Error("Expected an assistant message");
+    expect(queuedMessage.status.type).not.toBe("running");
+  });
+
   it("uses the company user label for current-user comments instead of collapsing to You", () => {
     const messages = buildIssueChatMessages({
       comments: [createComment({ authorUserId: "user-1" })],
@@ -1113,6 +1154,59 @@ describe("buildIssueChatMessages", () => {
         },
       },
     });
+  });
+
+  it("renders a queued linked run as a static queue-wait row, never running or finished (GLA-1462)", () => {
+    // Exactly the arguments RunChatSurface passes for a queued run: the run is
+    // routed through `linkedRuns` (not `liveRuns`), carries no transcript, and
+    // `hasOutputForRun` returns false. Before the fix this produced a
+    // `historical-run` assistant message with `waitingText: "Run finished"` and
+    // `status: { type: "complete" }` — a queued run reading as done.
+    const messages = buildIssueChatMessages({
+      comments: [],
+      timelineEvents: [],
+      linkedRuns: [
+        {
+          runId: "run-queued-1",
+          status: "queued",
+          agentId: "agent-1",
+          agentName: "CodexCoder",
+          createdAt: new Date("2026-04-06T12:01:00.000Z"),
+          startedAt: null,
+          finishedAt: null,
+        },
+      ],
+      liveRuns: [],
+      transcriptsByRunId: new Map([["run-queued-1", []]]),
+      hasOutputForRun: () => false,
+      includeSucceededRunsWithoutOutput: true,
+      currentUserId: "user-1",
+    });
+
+    expect(messages).toHaveLength(1);
+    const [message] = messages;
+    // A static queue-wait run row (kind "run") — the same shape used for other
+    // status badges — not an assistant transcript/live message.
+    expect(message).toMatchObject({
+      id: "run:run-queued-1",
+      role: "system",
+      metadata: {
+        custom: {
+          kind: "run",
+          runId: "run-queued-1",
+          runStatus: "queued",
+        },
+      },
+    });
+    // Never a live/running message.
+    expect(message?.role).not.toBe("assistant");
+    expect(message?.status).toBeUndefined();
+    // Never a completed ("Run finished") message.
+    const custom = message?.metadata?.custom as Record<string, unknown> | undefined;
+    expect(custom?.["kind"]).not.toBe("historical-run");
+    expect(custom?.["waitingText"]).toBeUndefined();
+    expect(JSON.stringify(message)).not.toContain("Run finished");
+    expect(JSON.stringify(message)).not.toContain("\"complete\"");
   });
 });
 

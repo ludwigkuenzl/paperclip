@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   approvals,
@@ -38,6 +39,10 @@ const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed
 // false-positive stopped-subtree review. The periodic watchdog reconciler
 // re-evaluates after the window, so a genuinely idle issue still triggers.
 const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 15_000;
+// A queued row is evidence of scheduling, not proof of indefinite liveness.
+// Beyond two default resource-lease windows the scheduler must either start,
+// reschedule, or expose the subtree as stopped for recovery.
+const TASK_WATCHDOG_QUEUED_PATH_MAX_LIVE_AGE_MS = 10 * 60_000;
 
 type ActorFields = {
   agentId?: string | null;
@@ -81,6 +86,8 @@ export type TaskWatchdogClassifierPath = {
   issueId: string | null;
   agentId?: string | null;
   status: string;
+  createdAt?: Date | string | null;
+  nextCheckAt?: Date | string | null;
 };
 
 export type TaskWatchdogClassifierWaitingPath = {
@@ -99,7 +106,10 @@ export type TaskWatchdogClassifierRelation = {
 export type TaskWatchdogClassifierConfig = Pick<
   IssueWatchdogSummary,
   "companyId" | "issueId" | "lastReviewedFingerprint"
->;
+> & {
+  watchdogAgentId?: string | null;
+  instructions?: string | null;
+};
 
 export type TaskWatchdogStoppedLeaf = {
   issueId: string;
@@ -247,10 +257,33 @@ function toEpochMs(value: Date | string | null | undefined): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function pathIssueIds(paths: TaskWatchdogClassifierPath[] | undefined, companyId: string) {
+function pathIssueIds(
+  paths: TaskWatchdogClassifierPath[] | undefined,
+  companyId: string,
+  evaluatedAt?: Date | string | null,
+) {
+  const evaluatedAtMs = toEpochMs(evaluatedAt) ?? Date.now();
   return new Set(
     (paths ?? [])
-      .filter((path) => path.companyId === companyId && typeof path.issueId === "string" && path.issueId.length > 0)
+      .filter((path) => {
+        if (path.companyId !== companyId || typeof path.issueId !== "string" || path.issueId.length === 0) {
+          return false;
+        }
+        if (path.status === "running") return true;
+        if (path.status === "scheduled_retry") {
+          const nextCheckAtMs = toEpochMs(path.nextCheckAt);
+          return nextCheckAtMs == null ||
+            nextCheckAtMs >= evaluatedAtMs - TASK_WATCHDOG_QUEUED_PATH_MAX_LIVE_AGE_MS;
+        }
+        if (path.status === "queued" || path.status === "deferred_issue_execution") {
+          const createdAtMs = toEpochMs(path.createdAt);
+          // Preserve compatibility for in-memory classifier callers that do
+          // not provide timestamps. Production collectors always do.
+          return createdAtMs == null ||
+            evaluatedAtMs - createdAtMs <= TASK_WATCHDOG_QUEUED_PATH_MAX_LIVE_AGE_MS;
+        }
+        return true;
+      })
       .map((path) => path.issueId as string),
   );
 }
@@ -269,15 +302,35 @@ function waitingPathIds(
 function stableStopFingerprint(input: {
   companyId: string;
   watchedIssueId: string;
+  watchdogAgentId?: string | null;
+  instructions?: string | null;
   leaves: TaskWatchdogStoppedLeaf[];
 }) {
   const payload = JSON.stringify({
-    version: 1,
+    version: 2,
     companyId: input.companyId,
     watchedIssueId: input.watchedIssueId,
+    watchdogAgentId: input.watchdogAgentId ?? null,
+    instructions: normalizeInstructions(input.instructions),
     leaves: input.leaves,
   });
   return `task_watchdog_stop:${createHash("sha256").update(payload).digest("hex")}`;
+}
+
+function stableWatchdogConfigurationFingerprint(watchdog: {
+  companyId: string;
+  issueId: string;
+  watchdogAgentId: string;
+  instructions?: string | null;
+}) {
+  const payload = JSON.stringify({
+    version: 1,
+    companyId: watchdog.companyId,
+    issueId: watchdog.issueId,
+    watchdogAgentId: watchdog.watchdogAgentId,
+    instructions: normalizeInstructions(watchdog.instructions),
+  });
+  return `task_watchdog_config:${createHash("sha256").update(payload).digest("hex")}`;
 }
 
 export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput): TaskWatchdogClassifierResult {
@@ -321,8 +374,8 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   const includedIds = included.map((issue) => issue.id);
   const includedIdSet = new Set(includedIds);
   const liveIssueIds = [
-    ...pathIssueIds(input.activeRuns, input.watchdog.companyId),
-    ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId),
+    ...pathIssueIds(input.activeRuns, input.watchdog.companyId, input.evaluatedAt),
+    ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId, input.evaluatedAt),
   ].filter((issueId) => includedIdSet.has(issueId));
   const uniqueLiveIssueIds = [...new Set(liveIssueIds)].sort();
   if (uniqueLiveIssueIds.length > 0) {
@@ -401,6 +454,8 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   const stopFingerprint = stableStopFingerprint({
     companyId: input.watchdog.companyId,
     watchedIssueId: input.watchdog.issueId,
+    watchdogAgentId: input.watchdog.watchdogAgentId,
+    instructions: input.watchdog.instructions,
     leaves,
   });
 
@@ -570,13 +625,11 @@ function watchdogWakeContext(input: {
           "transition_watched_subtree_issue_status",
           "reassign_watched_subtree_issues",
           "create_child_issues_under_non_watchdog_watched_subtree",
-          "create_product_bug_followups_outside_watched_subtree",
           "resolve_eligible_request_confirmation_plan_interactions",
           "update_reusable_watchdog_issue",
         ],
         deniedOperations: [
           "create_visible_probe_issues_or_throwaway_tasks",
-          "create_product_bug_followups_as_source_tree_children",
           "mutate_task_watchdog_descendants",
           "mutate_outside_watched_subtree",
           "resolve_board_only_or_security_sensitive_approvals",
@@ -817,6 +870,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
           contextSnapshot: heartbeatRuns.contextSnapshot,
+          createdAt: heartbeatRuns.createdAt,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         })
         .from(heartbeatRuns)
         .where(and(
@@ -833,6 +888,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
           issueId: issues.id,
+          createdAt: heartbeatRuns.createdAt,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         })
         .from(issues)
         .innerJoin(heartbeatRuns, eq(issues.executionRunId, heartbeatRuns.id))
@@ -848,6 +905,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           agentId: agentWakeupRequests.agentId,
           status: agentWakeupRequests.status,
           payload: agentWakeupRequests.payload,
+          createdAt: agentWakeupRequests.createdAt,
         })
         .from(agentWakeupRequests)
         .where(and(
@@ -965,12 +1023,22 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromRunContext(row.contextSnapshot),
-      })).concat(activeIssueRunRows),
+        createdAt: row.createdAt,
+        nextCheckAt: row.scheduledRetryAt,
+      })).concat(activeIssueRunRows.map((row) => ({
+        companyId: row.companyId,
+        agentId: row.agentId,
+        status: row.status,
+        issueId: row.issueId,
+        createdAt: row.createdAt,
+        nextCheckAt: row.scheduledRetryAt,
+      }))),
       queuedWakeRequests: wakeRows.map((row) => ({
         companyId: row.companyId,
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromWakePayload(row.payload),
+        createdAt: row.createdAt,
       })),
       blockers: blockerRows,
       pendingInteractions: interactionRows,
@@ -1171,6 +1239,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     watchdog: IssueWatchdogRow;
     sourceIssue: IssueRow;
     classification: Extract<TaskWatchdogClassifierResult, { state: "stopped" }>;
+    configurationChanged: boolean;
     runId?: string | null;
   }) {
     const existing = input.watchdog.watchdogIssueId
@@ -1189,7 +1258,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     if (fallback) {
       const shouldReopen = isTerminalIssueStatus(fallback.status) ||
         fallback.status === "backlog" ||
-        await watchdogIssueNeedsFreshWake(fallback);
+        await watchdogIssueNeedsFreshWake(fallback) ||
+        input.configurationChanged;
       const watchdogIssue = shouldReopen
         ? await issuesSvc.update(fallback.id, {
           status: "todo",
@@ -1299,17 +1369,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       watchdog.companyId,
       sourceIssue.id,
     ))?.id ?? null;
-    if (existingWatchdogIssueId && await hasLivePathForIssue(watchdog.companyId, existingWatchdogIssueId)) {
-      await db
-        .update(issueWatchdogs)
-        .set({
-          watchdogIssueId: existingWatchdogIssueId,
-          lastObservedFingerprint: classification.stopFingerprint,
-          updatedAt: new Date(),
-        })
-        .where(eq(issueWatchdogs.id, watchdog.id));
-      return { state: "watchdog_live" as const, classification, watchdogIssueId: existingWatchdogIssueId };
-    }
     const existingWatchdogIssue = existingWatchdogIssueId
       ? await db
         .select()
@@ -1321,6 +1380,43 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ))
         .then((rows) => rows[0] ?? null)
       : null;
+    const currentConfigurationFingerprint = stableWatchdogConfigurationFingerprint(watchdog);
+    const previousConfigurationFingerprint = existingWatchdogIssueId
+      ? await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, watchdog.companyId),
+          eq(activityLog.action, "issue.task_watchdog_triggered"),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, watchdog.issueId),
+          sql`${activityLog.details}->>'watchdogId' = ${watchdog.id}`,
+        ))
+        .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+        .limit(1)
+        .then((rows) => readNonEmptyString(parseObject(rows[0]?.details).watchdogConfigurationFingerprint))
+      : null;
+    const configurationChanged = Boolean(
+      existingWatchdogIssue && (
+        existingWatchdogIssue.assigneeAgentId !== watchdog.watchdogAgentId ||
+        previousConfigurationFingerprint !== currentConfigurationFingerprint
+      ),
+    );
+    if (
+      existingWatchdogIssueId &&
+      !configurationChanged &&
+      await hasLivePathForIssue(watchdog.companyId, existingWatchdogIssueId)
+    ) {
+      await db
+        .update(issueWatchdogs)
+        .set({
+          watchdogIssueId: existingWatchdogIssueId,
+          lastObservedFingerprint: classification.stopFingerprint,
+          updatedAt: new Date(),
+        })
+        .where(eq(issueWatchdogs.id, watchdog.id));
+      return { state: "watchdog_live" as const, classification, watchdogIssueId: existingWatchdogIssueId };
+    }
     if (await sameFingerprintWatchdogReviewIsStillOpen(existingWatchdogIssue, classification.stopFingerprint)) {
       if (
         watchdog.watchdogIssueId !== existingWatchdogIssue!.id ||
@@ -1346,6 +1442,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       watchdog,
       sourceIssue,
       classification,
+      configurationChanged,
       runId: opts.runId ?? null,
     });
     const now = new Date();
@@ -1374,6 +1471,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         watchdogId: watchdog.id,
         watchdogIssueId: watchdogIssue.id,
         stopFingerprint: classification.stopFingerprint,
+        watchdogConfigurationFingerprint: currentConfigurationFingerprint,
         stoppedLeaves: classification.stoppedLeaves,
       },
     });

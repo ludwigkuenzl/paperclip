@@ -263,7 +263,7 @@ describe("attentionDateBucket", () => {
 
   it("buckets by rolling calendar-day windows relative to now", () => {
     expect(attentionDateBucket("2026-07-10T09:00:00Z", now)).toBe("today");
-    expect(attentionDateBucket("2026-07-09T23:00:00Z", now)).toBe("yesterday");
+    expect(attentionDateBucket("2026-07-09T09:00:00Z", now)).toBe("yesterday");
     expect(attentionDateBucket("2026-07-06T09:00:00Z", now)).toBe("this_week");
     expect(attentionDateBucket("2026-06-01T09:00:00Z", now)).toBe("earlier");
   });

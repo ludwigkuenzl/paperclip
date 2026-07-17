@@ -76,6 +76,7 @@ import { PropertyChip, PropertyRow, PropertySection } from "./primitives";
 import { IssueCasesPanel } from "../IssueCasesPanel";
 import { ExpandRelationListButton, RemovableIssueReferencePill } from "./relation-controls";
 import { Badge } from "@/components/ui/badge";
+import { defaultExecutionWorkspaceSelectionForProject } from "../../lib/project-workspace-defaults";
 
 function TruncatedCopyable({ value, icon: Icon }: { value: string; icon: ComponentType<{ className?: string }> }) {
   const [copied, setCopied] = useState(false);
@@ -1623,7 +1624,7 @@ export function IssueProperties({
               )}
               onClick={() => {
                 if (option.kind === "project") {
-                  const defaultMode = defaultExecutionWorkspaceModeForProject(option.project);
+                  const defaultMode = defaultExecutionWorkspaceSelectionForProject(option.project);
                   trackRecentProject(option.project.id);
                   onUpdate({
                     projectId: option.project.id,

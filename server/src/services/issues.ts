@@ -19,6 +19,7 @@ import {
   executionWorkspaces,
   issueApprovals,
   issueAttachments,
+  issueCreateIdempotencyKeys,
   issueInboxArchives,
   issueLabels,
   issueWatchdogs,
@@ -59,8 +60,10 @@ import {
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
+  isIssueLifecycleContractTransitionAllowed,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  type IssueLifecycleContractState,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -102,6 +105,7 @@ import {
 } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { resolveIssueLifecycleEnforcementModeForCompany } from "./issue-lifecycle-enforcement.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -149,10 +153,41 @@ function wakeDiagnosticActivityTargetsIssue(issueId: string) {
   )`;
 }
 
-function assertTransition(from: string, to: string) {
+function assertTransition(
+  companyId: string,
+  from: string,
+  to: string,
+  context?: {
+    activeRecoveryResolution?: boolean;
+    handoffRollback?: { committedStatus: string; previousStatus: string };
+  },
+) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
     throw conflict(`Unknown issue status: ${to}`);
+  }
+  if (
+    context?.handoffRollback?.committedStatus === from &&
+    context.handoffRollback.previousStatus === to
+  ) {
+    return;
+  }
+  if (
+    resolveIssueLifecycleEnforcementModeForCompany(companyId) === "enforce" &&
+    !isIssueLifecycleContractTransitionAllowed(
+      from as IssueLifecycleContractState,
+      to as IssueLifecycleContractState,
+    )
+  ) {
+    throw conflict(`Issue lifecycle contract does not allow transition ${from} -> ${to}`);
+  }
+  if (
+    resolveIssueLifecycleEnforcementModeForCompany(companyId) === "enforce" &&
+    from === "blocked" &&
+    (to === "done" || to === "in_review") &&
+    context?.activeRecoveryResolution !== true
+  ) {
+    throw conflict(`Issue lifecycle transition ${from} -> ${to} requires an active recovery resolution`);
   }
 }
 
@@ -575,6 +610,9 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   actorRunId?: string | null;
   actorResponsibleUserId?: string | null;
   trustExplicitResponsibleUserId?: boolean;
+  idempotencyKey?: string | null;
+  allowDuplicate?: boolean;
+  onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -1577,12 +1615,13 @@ async function watchdogMapForIssues(dbOrTx: any, rows: IssueRow[]): Promise<Map<
 }
 
 const ACTIVE_RUN_STATUSES = ["queued", "running"];
+// A persisted retry timer is only a future promise, not an actively executing
+// blocker path. Treating it as covered hid work whose retry never fired.
 const BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES = ["queued", "running"];
 const BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution"];
 const BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES = ["pending"];
 const BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES = ["pending", "revision_requested"];
 const BLOCKER_ATTENTION_OPEN_RECOVERY_ORIGIN_KIND = "harness_liveness_escalation";
-const BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ORIGIN_KIND = "issue_productivity_review";
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
@@ -2079,43 +2118,13 @@ async function listIssueBlockerAttentionMap(
             ne(issues.status, "done"),
           ),
         );
-      const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
-        .select({
-          issueId: issues.parentId,
-          blockerIssueId: issues.id,
-          id: issues.id,
-          companyId: issues.companyId,
-          parentId: issues.parentId,
-          identifier: issues.identifier,
-          title: issues.title,
-          status: issues.status,
-          executionRunId: issues.executionRunId,
-          assigneeAgentId: issues.assigneeAgentId,
-          assigneeUserId: issues.assigneeUserId,
-        })
-        .from(issues)
-        .where(
-          and(
-            eq(issues.companyId, companyId),
-            inArray(issues.parentId, chunk),
-            notInArray(issues.status, BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES),
-          ),
-        );
-      const [explicitBlockerRows, childRows] = await Promise.all([
-        explicitBlockerRowsPromise,
-        childRowsPromise,
-      ]);
+      const explicitBlockerRows = await explicitBlockerRowsPromise;
 
-      appendBlockerAttentionEdges(edgesByIssueId, [
-        ...explicitBlockerRows
-          .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
-          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
-        ...childRows
-          .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
-          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
-      ]);
+      appendBlockerAttentionEdges(edgesByIssueId, explicitBlockerRows
+        .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
+        .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })));
 
-      for (const row of [...explicitBlockerRows, ...childRows]) {
+      for (const row of explicitBlockerRows) {
         if (!row.issueId || nodesById.has(row.blockerIssueId)) continue;
         nodesById.set(row.blockerIssueId, {
           id: row.blockerIssueId,
@@ -2391,9 +2400,7 @@ async function listIssueBlockerAttentionMap(
       reason = "stalled_review";
     } else {
       state = "covered";
-      reason = topLevelEdges.every((edge) => nodesById.get(edge.blockerIssueId)?.parentId === root.id)
-        ? "active_child"
-        : "active_dependency";
+      reason = "active_dependency";
     }
 
     attentionMap.set(root.id, createIssueBlockerAttention({
@@ -2789,6 +2796,7 @@ function readSuccessfulRunHandoffFromActivity(row: {
 
   return {
     state,
+    lifecycleState: state === "escalated" ? "handoff_failed" : null,
     required: state === "required",
     sourceRunId:
       readStringFromRecord(details, "sourceRunId")
@@ -2985,7 +2993,7 @@ async function listIssueBlockedInboxAttentionMap(
       .where(and(
         eq(issues.companyId, companyId),
         visibleIssueCondition(),
-        notInArray(issues.status, [...BLOCKED_INBOX_TERMINAL_STATUSES]),
+        ne(issues.status, "done"),
       )),
     dbOrTx
       .select({
@@ -3117,6 +3125,7 @@ async function listIssueBlockedInboxAttentionMap(
 
   const openRecoveryIssues = graphIssues
     .filter((issue) => BLOCKED_INBOX_RECOVERY_ORIGIN_KINDS.includes(issue.originKind as typeof BLOCKED_INBOX_RECOVERY_ORIGIN_KINDS[number]))
+    .filter((issue) => !BLOCKED_INBOX_TERMINAL_STATUSES.includes(issue.status as typeof BLOCKED_INBOX_TERMINAL_STATUSES[number]))
     .flatMap((issue) => {
       const entries = [{ companyId, issueId: issue.id, status: issue.status }];
       if (issue.originKind === "harness_liveness_escalation") {
@@ -3188,7 +3197,7 @@ async function listIssueBlockedInboxAttentionMap(
     }
     const source = issueRef(row);
     const handoff = handoffMap.get(row.id);
-    if (handoff && (handoff.required || handoff.state === "escalated")) {
+    if (handoff && (handoff.required || handoff.lifecycleState === "handoff_failed")) {
       result.set(row.id, attentionBase({
         state: "missing_disposition",
         reason: "missing_successful_run_disposition",
@@ -3634,6 +3643,10 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+
+  function normalizeCreateIssueTitle(title: string) {
+    return title.trim().replace(/\s+/g, " ").toLowerCase();
+  }
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -5972,10 +5985,7 @@ export function issueService(db: Db) {
       });
     },
 
-    create: async (
-      companyId: string,
-      data: IssueCreateInput,
-    ) => {
+    create: async (companyId: string, data: IssueCreateInput) => {
       const {
         labelIds: inputLabelIds,
         blockedByIssueIds,
@@ -5986,6 +5996,9 @@ export function issueService(db: Db) {
         actorRunId,
         actorResponsibleUserId,
         trustExplicitResponsibleUserId,
+        idempotencyKey: rawIdempotencyKey,
+        allowDuplicate,
+        onDeduplicated,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -6007,19 +6020,96 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       return db.transaction(async (tx) => {
+        const idempotencyKey = rawIdempotencyKey?.trim() || null;
+        const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
+        if (allowDuplicate === false) {
+          const titleGuardKey =
+            `issue-create:title:${companyId}:${issueData.parentId ?? "root"}:${normalizedTitle}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${titleGuardKey}, 0))`);
+        }
+        if (idempotencyKey) {
+          const idempotencyGuardKey = `issue-create:idempotency:${companyId}:${idempotencyKey}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${idempotencyGuardKey}, 0))`);
+        }
+
+        let existingIssue: typeof issues.$inferSelect | undefined;
+        let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
+        if (idempotencyKey) {
+          [existingIssue] = await tx
+            .select()
+            .from(issueCreateIdempotencyKeys)
+            .innerJoin(issues, eq(issueCreateIdempotencyKeys.issueId, issues.id))
+            .where(and(
+              eq(issueCreateIdempotencyKeys.companyId, companyId),
+              eq(issueCreateIdempotencyKeys.idempotencyKey, idempotencyKey),
+            ))
+            .limit(1)
+            .then((rows) => rows.map((row) => row.issues));
+          if (existingIssue) deduplicationReason = "idempotency_key";
+        }
+        if (!existingIssue && allowDuplicate === false) {
+          [existingIssue] = await tx
+            .select()
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              issueData.parentId ? eq(issues.parentId, issueData.parentId) : isNull(issues.parentId),
+              isNull(issues.hiddenAt),
+              notInArray(issues.status, ["done", "cancelled"]),
+              gte(issues.createdAt, new Date(Date.now() - 48 * 60 * 60 * 1000)),
+              sql`lower(regexp_replace(btrim(${issues.title}), '\\s+', ' ', 'g')) = ${normalizedTitle}`,
+            ))
+            .orderBy(asc(issues.createdAt), asc(issues.id))
+            .limit(1);
+          if (existingIssue) deduplicationReason = "recent_open_title";
+        }
+        if (existingIssue) {
+          if (idempotencyKey) {
+            await tx
+              .insert(issueCreateIdempotencyKeys)
+              .values({ companyId, idempotencyKey, issueId: existingIssue.id })
+              .onConflictDoNothing();
+          }
+          if (deduplicationReason) onDeduplicated?.(deduplicationReason);
+          const [enriched] = await withIssueLabels(tx, [existingIssue]);
+          const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
+          return withRelations;
+        }
+
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
         let executionWorkspaceId = issueData.executionWorkspaceId ?? null;
         let executionWorkspacePreference = issueData.executionWorkspacePreference ?? null;
         let executionWorkspaceSettings =
           (issueData.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null;
+        const requestedWorkspaceReuse = issueData.executionWorkspacePreference === "reuse_existing";
+        const requestedActionClass =
+          issueData.executionWorkspaceSettings &&
+          typeof issueData.executionWorkspaceSettings === "object" &&
+          !Array.isArray(issueData.executionWorkspaceSettings) &&
+          issueData.executionWorkspaceSettings.resourceControl &&
+          typeof issueData.executionWorkspaceSettings.resourceControl === "object" &&
+          !Array.isArray(issueData.executionWorkspaceSettings.resourceControl)
+            ? (issueData.executionWorkspaceSettings.resourceControl as Record<string, unknown>).actionClass
+            : null;
+        const inferredReviewWorkspaceSourceIssueId =
+          !inheritExecutionWorkspaceFromIssueId &&
+          issueData.executionWorkspaceId === undefined &&
+          requestedWorkspaceReuse &&
+          requestedActionClass === "review" &&
+          blockedByIssueIds?.length === 1
+            ? blockedByIssueIds[0]
+            : null;
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
-          : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
+          : inheritExecutionWorkspaceFromIssueId ?? inferredReviewWorkspaceSourceIssueId ?? issueData.parentId ?? null;
+        const hasExplicitExecutionWorkspaceIdSelection = issueData.executionWorkspaceId !== undefined;
         const hasExplicitExecutionWorkspaceOverride =
-          issueData.executionWorkspaceId !== undefined ||
-          issueData.executionWorkspacePreference !== undefined ||
-          issueData.executionWorkspaceSettings !== undefined;
+          hasExplicitExecutionWorkspaceIdSelection ||
+          (!requestedWorkspaceReuse && (
+            issueData.executionWorkspacePreference !== undefined ||
+            issueData.executionWorkspaceSettings !== undefined
+          ));
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
           if (issueData.projectId == null && workspaceSource.projectId) {
@@ -6046,10 +6136,16 @@ export function issueService(db: Db) {
               executionWorkspacePreference = "reuse_existing";
               executionWorkspaceSettings = {
                 ...((workspaceSource.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? {}),
+                ...(executionWorkspaceSettings ?? {}),
                 mode: issueExecutionWorkspaceModeForPersistedWorkspace(sourceWorkspace.mode),
               };
             }
           }
+        }
+        if (isolatedWorkspacesEnabled && requestedWorkspaceReuse && !executionWorkspaceId) {
+          throw unprocessable(
+            "reuse_existing requires an explicit executionWorkspaceId or an inherited source issue with an active execution workspace",
+          );
         }
         if (issueData.projectId == null && projectWorkspaceId) {
           const workspace = await assertValidProjectWorkspace(companyId, null, projectWorkspaceId, tx);
@@ -6192,6 +6288,13 @@ export function issueService(db: Db) {
         );
 
         const [issue] = await tx.insert(issues).values(values).returning();
+        if (idempotencyKey) {
+          await tx.insert(issueCreateIdempotencyKeys).values({
+            companyId,
+            idempotencyKey,
+            issueId: issue.id,
+          });
+        }
         if (watchdog) {
           await upsertIssueWatchdogForIssue(tx, companyId, issue.id, {
             agentId: watchdog.agentId,
@@ -6231,6 +6334,10 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        lifecycleTransitionContext?: {
+          activeRecoveryResolution?: boolean;
+          handoffRollback?: { committedStatus: string; previousStatus: string };
+        };
       },
       dbOrTx: any = db,
     ) => {
@@ -6246,6 +6353,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        lifecycleTransitionContext,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -6256,7 +6364,7 @@ export function issueService(db: Db) {
       }
 
       if (issueData.status) {
-        assertTransition(existing.status, issueData.status);
+        assertTransition(existing.companyId, existing.status, issueData.status, lifecycleTransitionContext);
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {

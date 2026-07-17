@@ -120,6 +120,8 @@ import {
   useResourceMemberships,
 } from "../hooks/useResourceMemberships";
 import { Badge } from "@/components/ui/badge";
+import { QueueTelemetryDetails, RunQueueWaitBadge } from "../components/RunQueueWait";
+import { isRunLive, isRunQueued } from "../lib/run-queue-status";
 
 const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string }> = {
   succeeded: { icon: CheckCircle2, color: "text-green-600 dark:text-green-400" },
@@ -1176,16 +1178,26 @@ export function AgentDetail() {
             }
           >
             {mobileLiveRun && (
-              <Link
-                to={`/agents/${canonicalAgentRef}/runs/${mobileLiveRun.id}`}
-                className="sm:hidden flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-blue-500/10 hover:bg-blue-500/20 transition-colors no-underline"
-              >
-                <span className="relative flex h-2 w-2">
-                  <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
-                </span>
-                <span className="text-(length:--text-micro) font-medium text-blue-600 dark:text-blue-400">Live</span>
-              </Link>
+              isRunLive(mobileLiveRun.status) ? (
+                <Link
+                  to={`/agents/${canonicalAgentRef}/runs/${mobileLiveRun.id}`}
+                  className="sm:hidden flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-blue-500/10 hover:bg-blue-500/20 transition-colors no-underline"
+                >
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+                  </span>
+                  <span className="text-(length:--text-micro) font-medium text-blue-600 dark:text-blue-400">Live</span>
+                </Link>
+              ) : (
+                <Link
+                  to={`/agents/${canonicalAgentRef}/runs/${mobileLiveRun.id}`}
+                  className="sm:hidden flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/10 hover:bg-amber-500/20 transition-colors no-underline"
+                >
+                  <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" aria-hidden />
+                  <span className="text-(length:--text-micro) font-medium text-amber-700 dark:text-amber-300">Queued</span>
+                </Link>
+              )
             )}
           </AgentActionButtons>
         </div>
@@ -1418,7 +1430,8 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
 
   const liveRun = sorted.find((r) => r.status === "running" || r.status === "queued");
   const run = liveRun ?? sorted[0];
-  const isLive = run.status === "running" || run.status === "queued";
+  const isLive = isRunLive(run.status);
+  const isQueued = isRunQueued(run.status);
   const statusInfo = runStatusIcons[run.status] ?? { icon: Clock, color: "text-neutral-400" };
   const StatusIcon = statusInfo.icon;
   const summaryRaw = run.resultJson
@@ -1453,7 +1466,8 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
               <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
             </span>
           )}
-          {isLive ? "Live Run" : "Latest Run"}
+          {isQueued && <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" aria-hidden />}
+          {isLive ? "Live Run" : isQueued ? "Queued Run" : "Latest Run"}
         </h3>
         <Link
           to={`/agents/${agentId}/runs/${run.id}`}
@@ -1467,12 +1481,13 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
         to={`/agents/${agentId}/runs/${run.id}`}
         className={cn(
           "block border rounded-lg p-4 space-y-2 w-full no-underline transition-colors hover:bg-muted/50 cursor-pointer",
-          isLive ? "border-blue-500/30 shadow-(--shadow-extract-14)" : "border-border"
+          isLive ? "border-blue-500/30 shadow-(--shadow-extract-14)" : isQueued ? "border-amber-500/30" : "border-border"
         )}
       >
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <StatusIcon className={cn("h-3.5 w-3.5", statusInfo.color, run.status === "running" && "animate-spin")} />
           <StatusBadge status={run.status} />
+          <RunQueueWaitBadge status={run.status} telemetry={run.resourceQueueTelemetry} />
           <span className="font-mono text-xs text-muted-foreground">{run.id.slice(0, 8)}</span>
           <Badge variant="ghost" className={cn(
             "px-1.5 text-(length:--text-nano)",
@@ -1492,6 +1507,9 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
           </div>
         )}
       </Link>
+      {run.resourceQueueTelemetry ? (
+        <QueueTelemetryDetails telemetry={run.resourceQueueTelemetry} />
+      ) : null}
     </div>
   );
 }
@@ -3163,6 +3181,9 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 </Button>
               )}
             </div>
+            {run.resourceQueueTelemetry ? (
+              <QueueTelemetryDetails telemetry={run.resourceQueueTelemetry} />
+            ) : null}
             {/* Adapter type · provider · model */}
             {(() => {
               const displayProvider = metrics.provider
@@ -3471,7 +3492,12 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
     scrollHeight: 0,
     distanceFromBottom: Number.POSITIVE_INFINITY,
   });
+  // `isLive` gates the not-terminal polling/streaming machinery (running OR
+  // queued still warrant refresh). `isRunningNow` is the truly-live visual state
+  // — only a `running` run shows the "Live" pulse / streaming affordances; a
+  // `queued` run is waiting, not live.
   const isLive = run.status === "running" || run.status === "queued";
+  const isRunningNow = isRunLive(run.status);
   const { data: workspaceOperations = [] } = useQuery({
     queryKey: queryKeys.runWorkspaceOperations(run.id),
     queryFn: () => heartbeatsApi.workspaceOperations(run.id),
@@ -3879,7 +3905,11 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   }
 
   if (events.length === 0 && logLines.length === 0 && !logError) {
-    return <p className="text-xs text-muted-foreground">No log events.</p>;
+    return (
+      <p className="text-xs text-muted-foreground">
+        {isRunQueued(run.status) ? "Waiting to start…" : "No log events."}
+      </p>
+    );
   }
 
   const levelColors: Record<string, string> = {
@@ -3926,7 +3956,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
               </button>
             ))}
           </div>
-          {isLive && !isFollowing && (
+          {isRunningNow && !isFollowing && (
             <Button
               variant="ghost"
               size="xs"
@@ -3941,7 +3971,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
               Jump to live
             </Button>
           )}
-          {isLive && (
+          {isRunningNow && (
             <span className="flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400">
               <span className="relative flex h-2 w-2">
                 <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
@@ -3950,6 +3980,9 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
               Live
             </span>
           )}
+          {isRunQueued(run.status) && (
+            <RunQueueWaitBadge status={run.status} telemetry={run.resourceQueueTelemetry} />
+          )}
         </div>
       </div>
       <div className="max-h-(--sz-38rem) overflow-y-auto rounded-2xl border border-border/70 bg-background/40 p-3 sm:p-4">
@@ -3957,9 +3990,13 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
           entries={transcript}
           toolDecisions={toolDecisionLookup.data?.decisions ?? []}
           mode={transcriptMode}
-          streaming={isLive}
+          streaming={isRunningNow}
           limit={isLive ? LIVE_TRANSCRIPT_RENDER_LIMIT : undefined}
-          emptyMessage={run.logRef ? "Waiting for transcript..." : "No persisted transcript for this run."}
+          emptyMessage={isRunQueued(run.status)
+            ? "Waiting to start…"
+            : run.logRef
+              ? "Waiting for transcript..."
+              : "No persisted transcript for this run."}
         />
         {hasMoreLog && (
           <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">

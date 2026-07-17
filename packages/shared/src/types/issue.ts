@@ -521,6 +521,7 @@ export type SuccessfulRunHandoffStateKind = "required" | "resolved" | "escalated
 
 export interface SuccessfulRunHandoffState {
   state: SuccessfulRunHandoffStateKind;
+  lifecycleState?: "handoff_failed" | null;
   required: boolean;
   sourceRunId: string | null;
   correctiveRunId: string | null;

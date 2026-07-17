@@ -3,16 +3,13 @@ import type { TranscriptEntry } from "../adapters";
 import type { LiveRunForIssue } from "../api/heartbeats";
 import { IssueChatThread } from "./IssueChatThread";
 import type { IssueChatLinkedRun } from "../lib/issue-chat-messages";
+import { isRunLive, isRunQueued } from "../lib/run-queue-status";
 
 const EMPTY_COMMENTS: [] = [];
 const EMPTY_TIMELINE_EVENTS: [] = [];
 const EMPTY_LIVE_RUNS: [] = [];
 const EMPTY_LINKED_RUNS: [] = [];
 const handleEmbeddedAdd = async () => {};
-
-function isRunActive(run: LiveRunForIssue) {
-  return run.status === "queued" || run.status === "running";
-}
 
 interface RunChatSurfaceProps {
   run: LiveRunForIssue;
@@ -27,11 +24,15 @@ export const RunChatSurface = memo(function RunChatSurface({
   hasOutput,
   companyId,
 }: RunChatSurfaceProps) {
-  const active = isRunActive(run);
-  const liveRuns = useMemo(() => (active ? [run] : EMPTY_LIVE_RUNS), [active, run]);
+  // Only a truly-live (running) run drives the live/streaming message path. A
+  // queued run has produced no output and is surfaced through the static
+  // linked-run path, where it renders as waiting rather than live or complete.
+  const live = isRunLive(run.status);
+  const queued = isRunQueued(run.status);
+  const liveRuns = useMemo(() => (live ? [run] : EMPTY_LIVE_RUNS), [live, run]);
   const linkedRuns = useMemo<IssueChatLinkedRun[]>(
     () =>
-      active
+      live
         ? EMPTY_LINKED_RUNS
         : [{
             runId: run.id,
@@ -42,7 +43,7 @@ export const RunChatSurface = memo(function RunChatSurface({
             startedAt: run.startedAt,
             finishedAt: run.finishedAt,
           }],
-    [active, run],
+    [live, run],
   );
   const transcriptsByRunId = useMemo(
     () => new Map([[run.id, transcript as readonly TranscriptEntry[]]]),
@@ -59,7 +60,7 @@ export const RunChatSurface = memo(function RunChatSurface({
       showComposer={false}
       showJumpToLatest={false}
       variant="embedded"
-      emptyMessage={active ? "Waiting for run output..." : "No run output captured."}
+      emptyMessage={live ? "Waiting for run output..." : queued ? "Waiting to start…" : "No run output captured."}
       enableLiveTranscriptPolling={false}
       transcriptsByRunId={transcriptsByRunId}
       hasOutputForRun={(runId) => runId === run.id && hasOutput}

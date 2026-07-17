@@ -32,6 +32,7 @@ import {
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
+import { DELIVERY_CONTROL_ACTION_CLASSES } from "../delivery-control-contract.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
@@ -122,6 +123,12 @@ export const issueExecutionWorkspaceSettingsSchema = z
     environmentId: z.string().uuid().optional().nullable(),
     workspaceStrategy: executionWorkspaceStrategySchema.optional().nullable(),
     workspaceRuntime: z.record(z.string(), z.unknown()).optional().nullable(),
+    resourceControl: z.object({
+      actionClass: z.enum(DELIVERY_CONTROL_ACTION_CLASSES),
+      resourceKey: z.string().trim().min(1).max(512),
+      changeId: z.string().trim().min(1).max(512).optional().nullable(),
+      idempotencyKey: z.string().trim().min(1).max(1_024).optional().nullable(),
+    }).strict().optional().nullable(),
   })
   .strict();
 
@@ -410,11 +417,20 @@ const createIssueBaseSchema = z.object({
   }).strict().optional().nullable(),
 });
 
+const createIssueDuplicateGuardSchema = {
+  idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),
+  allowDuplicate: z.boolean()
+    .describe("Bypasses recent-title duplicate detection; idempotency keys always replay their original issue")
+    .optional()
+    .default(false),
+};
+
 export const createIssueInputSchema = createIssueBaseSchema.extend({
   status: createIssueBaseSchema.shape.status.optional(),
+  ...createIssueDuplicateGuardSchema,
 });
 
-export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema);
+export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema.extend(createIssueDuplicateGuardSchema));
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
@@ -428,7 +444,6 @@ export type UpsertIssueWatchdog = z.infer<typeof upsertIssueWatchdogSchema>;
 export const createChildIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema
   .omit({
     parentId: true,
-    inheritExecutionWorkspaceFromIssueId: true,
     watchdogDiscovery: true,
   })
   .extend({

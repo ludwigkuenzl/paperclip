@@ -45,6 +45,7 @@ import type {
 } from "@paperclipai/shared";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import { useLiveRunTranscripts } from "./transcript/useLiveRunTranscripts";
+import { useSecondTick } from "../hooks/useSecondTick";
 import { usePaperclipIssueRuntime, type PaperclipIssueRuntimeReassignment } from "../hooks/usePaperclipIssueRuntime";
 import { useOptionalToastActions } from "../context/ToastContext";
 import { copyTextToClipboard } from "../lib/clipboard";
@@ -170,7 +171,7 @@ import { nextWorkMode, titleForPendingWorkMode, workModeMetaFor, workModeMetaLis
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
-import { AlertTriangle, ArrowRight, Brain, Check, ChevronDown, ClipboardList, Copy, Hammer, Loader2, MoreHorizontal, Paperclip, PauseCircle, Search, Square, ThumbsDown, ThumbsUp, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowRight, Brain, Check, ChevronDown, ClipboardList, Clock, Copy, Hammer, Loader2, MoreHorizontal, Paperclip, PauseCircle, Search, Square, ThumbsDown, ThumbsUp, Trash2 } from "lucide-react";
 import { IssueBlockedNotice } from "./IssueBlockedNotice";
 import { IssueAssignedBacklogNotice } from "./IssueAssignedBacklogNotice";
 import {
@@ -305,12 +306,10 @@ function findCoTSegmentIndex(
 }
 
 function useLiveElapsed(startMs: number | null | undefined, active: boolean): string | null {
-  const [, rerender] = useState(0);
-  useEffect(() => {
-    if (!active || !startMs) return;
-    const interval = setInterval(() => rerender((n) => n + 1), 1000);
-    return () => clearInterval(interval);
-  }, [active, startMs]);
+  // Drive the 1s refresh from the shared page-wide ticker instead of a
+  // per-instance setInterval, so a thread with many live elements uses one
+  // timer rather than one per element.
+  useSecondTick(Boolean(active && startMs));
   if (!active || !startMs) return null;
   return formatDurationWords(Date.now() - startMs);
 }
@@ -1710,6 +1709,7 @@ function IssueChatAssistantMessage({
   const followUpRequested = custom.followUpRequested === true;
 
   const kind = typeof custom.kind === "string" ? custom.kind : null;
+  const isQueued = kind === "queued-run" || runStatus === "queued";
   const hasCommentText = message.content.some(
     (part) => part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0,
   );
@@ -1939,6 +1939,14 @@ function IssueChatAssistantMessage({
                   <Loader2 className="h-3 w-3 animate-spin" />
                   Running
                 </Badge>
+              ) : isQueued ? (
+                <Badge
+                  variant="outline"
+                  className="gap-1 border-amber-500/50 bg-amber-500/15 text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow) text-amber-700 dark:text-amber-300"
+                >
+                  <Clock className="h-3 w-3" />
+                  Queued
+                </Badge>
               ) : null}
             </div>
           )}
@@ -1954,13 +1962,18 @@ function IssueChatAssistantMessage({
                 {message.content.length === 0 && waitingText ? (
                   <div className="rounded-lg px-1 py-2">
                     <div className="flex min-w-0 items-center gap-2.5">
-                      <span className="inline-flex items-center gap-2 text-sm font-medium text-foreground/80">
-                        {agentIcon ? (
+                      <span className={cn(
+                        "inline-flex items-center gap-2 text-sm font-medium",
+                        isQueued ? "text-amber-700 dark:text-amber-300" : "text-foreground/80",
+                      )}>
+                        {isQueued ? (
+                          <Clock className="h-4 w-4 shrink-0" />
+                        ) : agentIcon ? (
                           <AgentIcon icon={agentIcon} className="h-4 w-4 shrink-0" />
                         ) : (
                           <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
                         )}
-                        <span className="shimmer-text">{waitingText}</span>
+                        <span className={cn(!isQueued && "shimmer-text")}>{waitingText}</span>
                       </span>
                     </div>
                     <IssueChatLiveRunStatusLine custom={custom} active={isRunning} className="pl-6" />

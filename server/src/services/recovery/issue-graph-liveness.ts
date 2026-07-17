@@ -132,9 +132,13 @@ function hasActiveExecutionPath(
   issueId: string,
   activeRuns: IssueLivenessExecutionPathInput[],
   queuedWakeRequests: IssueLivenessExecutionPathInput[],
+  agentId?: string | null,
 ) {
   return [...activeRuns, ...queuedWakeRequests].some(
-    (entry) => entry.companyId === companyId && entry.issueId === issueId,
+    (entry) =>
+      entry.companyId === companyId &&
+      entry.issueId === issueId &&
+      (!agentId || entry.agentId === agentId),
   );
 }
 
@@ -399,13 +403,17 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     });
   }
 
-  function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
+  function hasNonExecutionWaitingPath(issue: IssueLivenessIssueInput) {
     return Boolean(issue.assigneeUserId) ||
       hasScheduledMonitor(issue, nowMs) ||
-      hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
       hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
       hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
       hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
+  }
+
+  function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
+    return hasNonExecutionWaitingPath(issue) ||
+      hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests);
   }
 
   function reviewFinding(
@@ -414,7 +422,6 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     dependencyPath: IssueLivenessIssueInput[],
   ): IssueLivenessFinding | null {
     if (reviewIssue.status !== "in_review") return null;
-    if (hasExplicitWaitingPath(reviewIssue)) return null;
 
     const ownerCandidates = ownerCandidatesForRecoveryIssue(reviewIssue, input.agents, agentsById, {
       includeStalledAssignee: true,
@@ -423,8 +430,32 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const participant = reviewIssue.executionState?.currentParticipant;
     const participantAgentId = readPrincipalAgentId(participant);
     if (participantAgentId) {
+      if (
+        hasNonExecutionWaitingPath(reviewIssue) ||
+        hasActiveExecutionPath(
+          reviewIssue.companyId,
+          reviewIssue.id,
+          activeRuns,
+          queuedWakeRequests,
+          participantAgentId,
+        )
+      ) return null;
+
       const participantAgent = agentsById.get(participantAgentId);
-      if (isInvokableAgent(participantAgent, agentsById) && participantAgent?.companyId === reviewIssue.companyId) return null;
+      if (isInvokableAgent(participantAgent, agentsById) && participantAgent?.companyId === reviewIssue.companyId) {
+        return finding({
+          issue: source,
+          state: "in_review_without_action_path",
+          reason: `${issueLabel(reviewIssue)} has an invokable review participant, but no reviewer wake, active run, interaction, approval, monitor, or recovery action owns the next action.`,
+          dependencyPath,
+          recoveryIssue: reviewIssue,
+          recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+          recommendedOwnerCandidates: ownerCandidates,
+          recommendedAction:
+            `Queue one bounded reviewer wake for ${issueLabel(reviewIssue)} or return the issue to active work with a clear change request.`,
+          participantAgentId,
+        });
+      }
 
       return finding({
         issue: source,
@@ -441,6 +472,8 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
         participantAgentId,
       });
     }
+
+    if (hasExplicitWaitingPath(reviewIssue)) return null;
 
     if (principalIsResolvableUser(participant)) return null;
 
@@ -590,13 +623,26 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   }
 
   for (const issue of input.issues) {
-    if (issue.status === "blocked") {
+    const hasUnresolvedBlockerEdge = (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
+      if (relation.companyId !== issue.companyId) return false;
+      const blocker = issuesById.get(relation.blockerIssueId);
+      return Boolean(blocker && blocker.companyId === issue.companyId && blocker.status !== "done");
+    });
+    const shouldInspectBlockedChain = issue.status === "blocked" || (
+      issue.status !== "done" &&
+      issue.status !== "cancelled" &&
+      Boolean(issue.assigneeAgentId) &&
+      hasUnresolvedBlockerEdge
+    );
+
+    let chainFinding: IssueLivenessFinding | null = null;
+    if (shouldInspectBlockedChain) {
       if (unresolvedBlockers.has(issue.id)) continue;
-      const chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
+      chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
       if (chainFinding) findings.push(chainFinding);
     }
 
-    if (issue.status === "in_review" && !unresolvedBlockers.has(issue.id)) {
+    if (issue.status === "in_review" && !chainFinding && !unresolvedBlockers.has(issue.id)) {
       const review = reviewFinding(issue, issue, [issue]);
       if (review) findings.push(review);
     }

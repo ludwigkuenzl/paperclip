@@ -39,6 +39,43 @@ describe("execution workspace policy helpers", () => {
     ).toBe("isolated_workspace");
   });
 
+  it("enforces the project mode when issue overrides are disabled", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+        },
+        issueSettings: { mode: "shared_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("isolated_workspace");
+
+    expect(
+      buildExecutionWorkspaceAdapterConfig({
+        agentConfig: {},
+        projectPolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+          workspaceRuntime: { services: [{ name: "project-service" }] },
+        },
+        issueSettings: {
+          mode: "shared_workspace",
+          workspaceStrategy: { type: "project_primary" },
+          workspaceRuntime: { services: [{ name: "issue-service" }] },
+        },
+        mode: "isolated_workspace",
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toMatchObject({
+      workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+      workspaceRuntime: { services: [{ name: "project-service" }] },
+    });
+  });
+
   it("centralizes unrunnable isolated worktree detection", () => {
     expect(
       isUnrunnableWorktreeCombo({
@@ -291,6 +328,30 @@ describe("execution workspace policy helpers", () => {
       mode: "shared_workspace",
       environmentId: "11111111-1111-4111-8111-111111111111",
     });
+    expect(
+      parseIssueExecutionWorkspaceSettings({
+        mode: "operator_branch",
+        resourceControl: {
+          actionClass: "deploy",
+          resourceKey: "vps:production",
+          changeId: "sha-123",
+          idempotencyKey: "deploy:production:sha-123",
+        },
+      }),
+    ).toEqual({
+      mode: "operator_branch",
+      resourceControl: {
+        actionClass: "deploy",
+        resourceKey: "vps:production",
+        changeId: "sha-123",
+        idempotencyKey: "deploy:production:sha-123",
+      },
+    });
+    expect(
+      parseIssueExecutionWorkspaceSettings({
+        resourceControl: { actionClass: "unknown", resourceKey: "vps:production" },
+      }),
+    ).toEqual({});
   });
 
   it("prefers the agent default environment", () => {

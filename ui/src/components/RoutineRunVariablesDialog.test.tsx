@@ -5,7 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Agent, ExecutionWorkspace, Project, RoutineVariable } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RoutineRunVariablesDialog } from "./RoutineRunVariablesDialog";
+import { buildInitialWorkspaceConfig, RoutineRunVariablesDialog } from "./RoutineRunVariablesDialog";
 
 let issueWorkspaceDraftCalls = 0;
 let issueWorkspaceDraft = {
@@ -237,6 +237,29 @@ describe("RoutineRunVariablesDialog", () => {
     };
     issueWorkspaceBranchName = null;
     latestWorkspaceIssue = null;
+  });
+
+  it("defaults project-backed routine runs to workspace inheritance", () => {
+    expect(buildInitialWorkspaceConfig(createProject())).toMatchObject({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: "inherit",
+      executionWorkspaceSettings: { mode: "inherit" },
+    });
+  });
+
+  it("ignores a saved routine workspace when the project policy is locked", () => {
+    const project = createProject();
+    project.executionWorkspacePolicy = {
+      ...project.executionWorkspacePolicy!,
+      defaultMode: "isolated_workspace",
+      allowIssueOverride: false,
+    };
+
+    expect(buildInitialWorkspaceConfig(project, createExecutionWorkspace())).toMatchObject({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: "inherit",
+      executionWorkspaceSettings: { mode: "inherit" },
+    });
   });
 
   afterEach(() => {
@@ -474,6 +497,55 @@ describe("RoutineRunVariablesDialog", () => {
       currentExecutionWorkspace: workspace,
       projectWorkspaceId: workspace.projectWorkspaceId,
     });
+
+    await flushUi(() => {
+      root.unmount();
+    });
+  });
+
+  it("does not inject a rejected default workspace branch for a locked project", async () => {
+    const project = createProject();
+    project.executionWorkspacePolicy = {
+      ...project.executionWorkspacePolicy!,
+      defaultMode: "isolated_workspace",
+      allowIssueOverride: false,
+    };
+    const workspace = createExecutionWorkspace();
+    const root = createRoot(container);
+    const queryClient = createQueryClient();
+
+    await flushUi(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <RoutineRunVariablesDialog
+            open
+            onOpenChange={() => {}}
+            companyId="company-1"
+            projects={[project]}
+            agents={[createAgent()]}
+            defaultProjectId="project-1"
+            defaultAssigneeAgentId="agent-1"
+            defaultExecutionWorkspace={workspace}
+            variables={[
+              {
+                name: "workspaceBranch",
+                label: null,
+                type: "text",
+                defaultValue: null,
+                required: true,
+                options: [],
+              },
+            ]}
+            isPending={false}
+            onSubmit={() => {}}
+          />
+        </QueryClientProvider>,
+      );
+    });
+
+    expect(Array.from(document.querySelectorAll("input"))
+      .some((input) => input.value === workspace.branchName)).toBe(false);
+    expect(document.body.textContent).toContain("Missing: workspaceBranch");
 
     await flushUi(() => {
       root.unmount();

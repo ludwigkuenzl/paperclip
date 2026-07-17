@@ -3655,15 +3655,25 @@ export function agentRoutes(
         .limit(targetRunCount - liveRuns.length);
 
       const rows = [...liveRuns, ...recentRuns];
+      const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(
+        companyId,
+        rows.map((run) => run.id),
+      );
       res.json(await Promise.all(rows.map(async (run) => ({
         ...heartbeat.decorateActiveRunStatus(run),
+        resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
         outputSilence: await heartbeat.buildRunOutputSilence(run),
       }))));
       return;
     }
 
+    const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(
+      companyId,
+      liveRuns.map((run) => run.id),
+    );
     res.json(await Promise.all(liveRuns.map(async (run) => ({
       ...heartbeat.decorateActiveRunStatus(run),
+      resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
       outputSilence: await heartbeat.buildRunOutputSilence(run),
     }))));
   });
@@ -3674,9 +3684,15 @@ export function agentRoutes(
     if (!run) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
+    const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(run.companyId, [run.id]);
     res.json(
       redactCurrentUserValue(
-        { ...decoratedRun, retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        {
+          ...decoratedRun,
+          retryExhaustedReason,
+          resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+        },
         await getCurrentUserRedactionOptions(),
       ),
     );
@@ -3702,6 +3718,76 @@ export function agentRoutes(
     }
 
     res.json(run);
+  });
+
+  router.post("/heartbeat-runs/:runId/resource-control-recovery", async (req, res) => {
+    assertBoard(req);
+    const runId = req.params.runId as string;
+    const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!existing) return;
+    await assertBoardCanManageAgentsForCompany(req, existing.companyId);
+
+    const disposition = req.body?.disposition;
+    const readback = asRecord(req.body?.readback);
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim().slice(0, 4000) : "";
+    const observedChangeId = req.body?.observedChangeId === null || typeof req.body?.observedChangeId === "string"
+      ? req.body.observedChangeId as string | null
+      : undefined;
+    const observedFencingToken = req.body?.observedFencingToken === null ||
+      (
+        typeof req.body?.observedFencingToken === "number" &&
+        Number.isSafeInteger(req.body.observedFencingToken) &&
+        req.body.observedFencingToken > 0
+      )
+      ? req.body.observedFencingToken as number | null
+      : undefined;
+    if (
+      (disposition !== "completed" && disposition !== "not_applied") ||
+      !readback ||
+      Object.keys(readback).length === 0 ||
+      !reason ||
+      observedChangeId === undefined ||
+      observedFencingToken === undefined
+    ) {
+      res.status(400).json({
+        error:
+          "disposition, reason, non-empty readback, observedChangeId, and observedFencingToken are required",
+      });
+      return;
+    }
+
+    try {
+      const lease = await heartbeat.resolveResourceControlRecoveryAfterReadback({
+        companyId: existing.companyId,
+        runId,
+        disposition,
+        observedChangeId,
+        observedFencingToken,
+        readback,
+        reason,
+      });
+      if (!lease) {
+        res.status(409).json({ error: "Run does not own a resource lease requiring recovery" });
+        return;
+      }
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "resource_control.recovery_readback_resolved",
+        entityType: "heartbeat_run",
+        entityId: runId,
+        details: {
+          leaseId: lease.id,
+          resourceKey: lease.resourceKey,
+          disposition,
+          reason,
+        },
+      });
+      res.json(lease);
+    } catch (error) {
+      res.status(409).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {
@@ -3846,8 +3932,13 @@ export function agentRoutes(
       )
       .orderBy(desc(heartbeatRuns.createdAt));
 
+    const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(
+      issue.companyId,
+      liveRuns.map((run) => run.id),
+    );
     res.json(await Promise.all(liveRuns.map(async (run) => ({
       ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
+      resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
       outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
     }))));
   });
@@ -3894,8 +3985,10 @@ export function agentRoutes(
     }
 
     const decoratedRun = heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id });
+    const resourceQueueTelemetry = await heartbeat.listResourceQueueTelemetry(issue.companyId, [run.id]);
     res.json({
       ...decoratedRun,
+      resourceQueueTelemetry: resourceQueueTelemetry.get(run.id) ?? null,
       agentId: agent.id,
       agentName: agent.name,
       adapterType: agent.adapterType,

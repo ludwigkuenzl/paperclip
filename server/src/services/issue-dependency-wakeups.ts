@@ -7,6 +7,7 @@ export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 const IDEMPOTENT_DEPENDENCY_WAKE_STATUSES = [
   "queued",
   "deferred_issue_execution",
+  "coalesced",
   "claimed",
   "completed",
 ] as const;

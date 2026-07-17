@@ -1,12 +1,74 @@
 # Execution Semantics
 
 Status: Current implementation guide
-Date: 2026-06-10
+Date: 2026-07-15
 Audience: Product and engineering
 
 This document explains how Paperclip interprets issue assignment, issue status, execution runs, wakeups, parent/sub-issue structure, and blocker relationships.
 
 `doc/SPEC-implementation.md` remains the V1 contract. This document is the detailed execution model behind that contract.
+
+## Versioned M1 Lifecycle Contract
+
+The machine-readable M1 contract is exported as `ISSUE_LIFECYCLE_EXECUTION_CONTRACT_V1` from `packages/shared/src/issue-lifecycle-contract.ts`.
+
+Its contract id is `paperclip.issue-lifecycle-execution`, version `1.0.0`. The canonical logical fields are `current_owner`, `current_state`, `next_action`, `next_owner`, `active_run_id`, `blocking_resource`, `blocker_reason`, `last_progress_at`, `next_wake_at`, and `retry_count`. They are derived from the existing issue, run, wake, recovery-action, relation, and monitor records; M1 does not require a destructive storage migration.
+
+`done` and `cancelled` are terminal during normal execution. Their only M1 reopen transition is guarded `-> todo` with an explicit `resume` intent; an inert comment or ordinary update is not a reopen.
+
+Lifecycle enforcement is controlled by `PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT`:
+
+- `off`: preserve legacy mutation and structural-parent wake behavior
+- `shadow` (default): preserve behavior and write versioned lifecycle findings to activity
+- `enforce`: for explicitly allowlisted companies, reject unsupported lifecycle transitions and create dispositions, and suppress structural parent-completion wakes that are not backed by an explicit blocker relation
+
+`enforce` is a canary-only rollout step and also requires the company id in `PAPERCLIP_ISSUE_LIFECYCLE_ENFORCEMENT_COMPANY_IDS` (comma-separated). An empty allowlist fails closed to `shadow`, not instance-wide enforcement. The effective company mode is read for each scoped mutation, so configuration readback does not depend on route construction. Roll back immediately by setting the mode to `off`; the contract adds no irreversible storage state and legacy activity/action names remain readable.
+
+Before enabling `enforce`, run a shadow observation window and record the baseline from `issue.lifecycle_shadow_finding` activities plus company-scoped wake-request idempotency keys, grouped by contract version, violation, actor type, and disposition. The minimum rollout comparison is:
+
+- attempted `in_progress` transitions without an execution path
+- attempted `in_review` transitions without a review path
+- legacy `issue_children_completed` wakes that had no explicit blocker edge
+- duplicate dependency-wake attempts for the same company-scoped idempotency key
+- resulting stranded-work and issue-graph recovery findings
+
+Promote only a bounded canary after each observed case is classified as a true violation or a documented compatibility exception. Compare canary rates with the shadow baseline and roll back to `off` if enforcement increases stranded work, suppresses a required explicit dependency wake, or rejects a valid human-owned path.
+
+### M1 implementation audit (2026-07-14)
+
+| Mechanism | Baseline drift | M1 behavior |
+| --- | --- | --- |
+| `in_review` route validation | Agent transitions were checked, but board transitions could create review state without a path. A typed agent participant could later appear healthy even when no reviewer wake was delivered. | Board drift is measured in `shadow` and rejected in `enforce`; the liveness classifier requires a queued/active reviewer path for agent participants. |
+| `in_progress` route validation | A direct mutation could create agent-owned active state without a run, wake, monitor, or recovery action; an arbitrary actor run id was not sufficient proof of an issue path. | Missing execution paths are measured in `shadow` and rejected in `enforce`; live run, queued wake, and scheduled-retry records are company/issue/agent checked. Human-owned work and a new agent assignment that queues a wake remain valid. |
+| create disposition | Create and child-create could persist `in_progress` or `in_review` before a durable execution/review path existed. | In canary `enforce`, active/review creates require a human owner or scheduled monitor; agent work is created as `todo` and enters active state through checkout/wake. Shadow records the legacy create. |
+| transition graph | Target status validation accepted any known status, even when the M1 graph did not contain the edge. | The issue service consumes the versioned transition graph in canary `enforce`; terminal reopen additionally requires explicit `resume` or `reopen` intent. |
+| dependency delivery | Route preflight was advisory and concurrent callers could pass it together; coalescing could retain a lower-priority structural/comment wake. | Enqueue uses a company/key transaction lock and in-transaction re-read. `issue_blockers_resolved` wins same-agent/same-issue wake merging. |
+| parent/child terminal wake | `done` and `cancelled` children could both produce a structural `issue_children_completed` wake even without a blocker edge. | Shadow records compatibility wakes; enforce suppresses them. Only an explicit blocker reaching `done` owns dependency completion. |
+| exhausted successful-run handoff | Recovery blocked the source, but recovery ownership could overwrite the source assignee and obscure failed accountability. | Delivery is transactional-or-compensating: when the ordered handoff cannot be confirmed, logical state is `handoff_failed`; the source is blocked, retains its previous owner, and exposes a separately owned recovery action with one bounded wake path. |
+
+The rollout flag changes only mutation/wake enforcement. The transaction-level idempotency and previous-owner retention fixes are invariant repairs and remain active in every mode. No M1 path requires replaying old exports or rewriting existing issue rows.
+
+## Resource-control canary contract
+
+The machine-readable action-class and lease contract is exported from `packages/shared/src/delivery-control-contract.ts`. It defines `read_only`, `review`, `vault_write`, and `isolated_write` as parallel-safe without a Paperclip resource lease. `shared_write`, `deploy`, and `external_action` require an exclusive lease before their adapter run may start.
+
+Resource enforcement is opt-in per issue during the canary phase. An issue opts in through `executionWorkspaceSettings.resourceControl` with an explicit `actionClass`, concrete `resourceKey`, stable `changeId`, and stable `idempotencyKey`. Issues without that explicit block retain the previous scheduling behavior unless the separate resource-control rollout is explicitly set to `enforce` for their company. Resource rollout uses `PAPERCLIP_RESOURCE_CONTROL_MODE=off|shadow|enforce` plus `PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS`; it defaults to `shadow`, and a configured `enforce` falls back to `shadow` for every company outside that allowlist. Delivery-control rollout variables do not activate resource-control denial. Paperclip does not infer permission for external parallel writes, and this slice does not raise any agent's general `maxConcurrentRuns` value.
+
+For an opted-in exclusive action, Paperclip:
+
+- takes a company/resource PostgreSQL transaction lock before inspecting or creating the durable lease
+- stores one active lease per `(companyId, resourceKey)` with a monotonically increasing fencing token
+- claims the lease, the queued heartbeat run, and the assigned issue execution lock in one transaction
+- renews a live lease from observable adapter output or runtime progress at most once per minute; process existence alone never renews it
+- leaves conflicting runs `queued` instead of starting their adapters
+- exposes `actionClass`, `resourceKey`, `waitReason`, `blockingRunId`, `waitingSinceAt`, `queuePosition`, and `nextCheckAt` on run read models
+- releases the lease when the owner run becomes terminal, without claiming that a successful process exit proves external target-state readback
+
+An expired lease is changed to `recovery_required`; it is never automatically stolen. A same-idempotency retry is also held until the target state is read back. A board operator with company-management permission resolves the row through `POST /api/heartbeat-runs/{runId}/resource-control-recovery`, supplying the observed change, fencing token, readback evidence, disposition, and reason. Verified completion changes the audit row to `completed`. Verified `not_applied` recovery permits a same-change retry by reacquiring the durable row with a strictly higher fencing token while retaining the previous readback in its audit metadata.
+
+The assigned-issue execution lock follows the same atomicity rule even when resource control is not opted in: `heartbeat_runs.status = running` and `issues.executionRunId = run.id` are committed together under an issue-row lock. If another run already owns the assigned issue, the later run stays queued and no second adapter starts.
+
+This is the backend canary foundation, not authorization to enable general external parallelism. Promotion still requires target-specific ownership/readback integration, bounded expired-lease recovery, UI verification, role concurrency canaries, deployment readback, and tested rollback. The compatibility rollback before promotion is to remove the issue's explicit `resourceControl` block and keep existing agent concurrency limits; a code rollback must revert the canary commit while retaining the additive lease table for audit/history until a separately reviewed data-retention decision is made.
 
 ## 1. Core Model
 
@@ -153,9 +215,10 @@ Use it for:
 - work breakdown
 - rollup context
 - explaining why a child issue exists
-- waking the parent assignee when all direct children become terminal
 
 Do not treat `parentId` as execution dependency by itself.
+
+Legacy and shadow mode may still emit `issue_children_completed` for compatibility and measure it as a lifecycle finding. Enforce mode suppresses that structural wake. If the parent must resume when a child completes, add an explicit blocker edge so the exact dependency wake path owns delivery.
 
 ### Blockers (`blockedByIssueIds`)
 
@@ -168,6 +231,8 @@ Use it for:
 - automatic wakeups when all blockers resolve
 
 Blocked issues should stay idle while blockers remain unresolved. Paperclip should not create a queued heartbeat run for that issue until the final blocker is done and the `issue_blockers_resolved` wake can start real work.
+
+`cancelled` is terminal for the blocker issue itself, but it does not satisfy the dependency. A cancelled blocker edge remains unresolved until the edge is removed or replaced, and Paperclip must surface blocker attention on the dependent regardless of whether that dependent is currently displayed as `blocked`, `todo`, `backlog`, or another non-terminal agent-owned status.
 
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.
 
@@ -266,6 +331,8 @@ An external wait counts as a live or waiting path only when the next move surviv
 - a first-class blocker or `blocked` disposition that names the external owner and concrete action required to unblock the issue
 - a delegated child issue with a responsible owner and its own healthy action path, plus a blocker edge when the source issue must wait for that child; `parentId` alone is not a dependency
 
+A one-shot issue monitor consumes its persisted `nextCheckAt` when it dispatches the assignee wake. If that monitor-consuming run is lost before it records a new disposition or future monitor, Paperclip restores exactly one bounded continuation using the existing process-loss retry limit; if that continuation is also lost, the normal recovery-action escalation owns the next step instead of creating another monitor loop.
+
 An unmanaged local process is not a durable action path. Shell jobs started with `&`, `nohup`, local polling loops, detached PTY sessions, adapter child processes, or similar background watchers do not keep an issue live unless Paperclip persists them as a run or pairs a managed runtime service with a monitor, scheduled wake, blocker, or delegated issue that owns the next check. A PID, session id, log file, comment, or promise to check later is evidence only. The process may be killed when the adapter invocation or heartbeat exits and cannot be assumed observable or recoverable by another worker.
 
 Before a heartbeat finalizes, its issue disposition must therefore be evaluated from durable Paperclip state, not from processes still visible only to that heartbeat. An agent-owned issue may remain `in_progress` after the heartbeat only when another valid action-path primitive already exists. If the only claimed continuation is a local/background watcher, finalization treats the issue as having no live path even when the process has not yet been observed exiting.
@@ -275,8 +342,8 @@ If useful deliverable work can continue without the external result, the agent s
 Recovery from an invalid external wait is bounded and idempotent:
 
 1. Record bounded evidence that the completed heartbeat left no durable action path, including the terminal run and any reported local watcher metadata without treating that metadata as liveness.
-2. Queue at most one normal-model continuation for the same source state and recovery fingerprint so the assignee can inspect the external result, replace the watcher with a durable wait, continue productive work, or choose a valid disposition.
-3. If that continuation also exits without creating a durable path, do not queue another equivalent continuation. Move the issue to `blocked` only when a real external dependency can be named; otherwise open or update an explicit recovery action with a named owner and concrete repair/escalation action.
+2. Queue at most two normal-model recovery continuations. Each attempt uses a stable issue/reason/source-run/attempt idempotency key so a duplicate scheduler tick cannot create another wake for the same attempt.
+3. If the second attempt exits without creating a durable path, do not queue another equivalent continuation. Move the issue to `blocked` only when a real external dependency can be named; otherwise open or update an explicit recovery action with a named owner and concrete repair/escalation action.
 4. New durable source activity may produce a new recovery fingerprint, but unchanged killed/local-watcher evidence must not create an infinite wake/recovery loop.
 
 This rule is intentionally conservative: local watcher evidence can help the recovery owner decide what happened, but only persisted control-plane state can prove that the work will move again.
@@ -414,18 +481,24 @@ This is review/approval state: execution is paused because the next move belongs
 
 A healthy `in_review` issue has at least one valid action path:
 
-- a typed execution-policy participant who can approve or request changes
+- a typed agent execution-policy participant with a queued or active reviewer wake, or a typed user participant who can act directly
 - a pending issue-thread interaction or linked approval waiting for a named responder
 - a human owner via `assigneeUserId`
 - an active run or queued wake that is expected to process the review state
 - an active one-shot monitor for an external service or async review loop that the assignee owns
 - an open explicit recovery action for an ambiguous review handoff
 
-Agent-assigned `in_review` with no typed participant is only healthy when one of the other paths exists. Assignment to the same agent that produced the handoff is not, by itself, a review path.
+Agent-assigned `in_review` with no delivered participant path is only healthy when one of the other paths exists. Naming an agent participant without queueing or running its reviewer wake is not delivery. Assignment to the same agent that produced the handoff is not, by itself, a review path.
 
 An `in_review` issue is stalled when it has no typed participant, no pending interaction or approval, no user owner, no active monitor, no active run, no queued wake, and no explicit recovery action. Paperclip should surface that state as recovery work rather than silently completing the issue or leaving blocker chains parked indefinitely.
 
 When an execution-policy review stage has a pending agent participant, the participant's run is part of the review path only while it is live or queued. If that participant run reaches a terminal state while `executionState.status` remains `pending`, no decision has been recorded. Paperclip should queue one bounded normal-model recovery wake for the same participant when the agent is invokable and no other review path exists. If that recovery run also finishes while the stage remains pending, or the participant cannot be invoked, Paperclip must move the source issue to an explicit blocked/recovery path instead of leaving `in_review` to drift silently.
+
+### Failed result handoff
+
+A successful adapter result is not a completed control-plane handoff until the result, next action, next owner, idempotent wake, wake confirmation, and final issue status have been committed in that order. Comments are evidence only.
+
+If the one bounded corrective handoff attempt still leaves no valid disposition, the logical lifecycle state is `handoff_failed`. It is represented compatibly as issue status `blocked` plus a `missing_disposition` recovery action with cause `successful_run_missing_state`. The source issue retains its previous assignee; the recovery action has its own owner and wake path. Recovery must not silently transfer source accountability.
 
 ### Issue monitors
 
@@ -480,8 +553,8 @@ Example:
 
 Recovery rule:
 
-- if the latest issue-linked run failed/timed out/cancelled and no live execution path remains, Paperclip queues one automatic assignment recovery wake
-- if that recovery wake also finishes and the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
+- if the latest issue-linked run failed/timed out/cancelled and no live execution path remains, Paperclip queues a bounded automatic assignment recovery wake
+- after at most two automatic attempts, if the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
 
 This is a dispatch recovery, not a continuation recovery.
 
@@ -496,12 +569,12 @@ Example:
 
 Recovery rule:
 
-- Paperclip queues one automatic continuation wake
-- if that continuation wake also finishes and the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
+- Paperclip queues a bounded automatic continuation wake
+- after at most two automatic attempts, if the issue is still stranded, Paperclip moves the issue to `blocked` and opens or updates an explicit recovery action when a bounded owner/action is known; the visible comment is evidence, not the recovery path by itself
 
 This is an active-work continuity recovery.
 
-The same bounded rule applies when the previous heartbeat reported waiting on a local/background watcher and that watcher was killed, disappeared, or was never represented by a durable Paperclip primitive. Paperclip queues at most one continuation for the same recovery fingerprint. If the continuation also leaves only local watcher evidence, Paperclip must surface a real blocker or explicit recovery action instead of repeating continuation recovery. A new monitor, scheduled wake, healthy delegated blocker issue, or other durable source mutation resolves that recovery fingerprint normally.
+The same bounded rule applies when the previous heartbeat reported waiting on a local/background watcher and that watcher was killed, disappeared, or was never represented by a durable Paperclip primitive. Paperclip queues at most two attempt-scoped continuations. If the second continuation also leaves only local watcher evidence, Paperclip must surface a real blocker or explicit recovery action instead of repeating continuation recovery. A new monitor, scheduled wake, healthy delegated blocker issue, or other durable source mutation resolves that recovery state normally.
 
 #### Deliberate wait is not a lost run
 
@@ -511,6 +584,8 @@ Recovery rule for a parked-for-review continuation:
 
 - if the issue has a real waiting target — open (non-terminal) sub-tasks or existing unresolved blockers — Paperclip converts the deliberate wait into a first-class dependency wait: it sets the issue `blocked` by those issues, keeps the original assignee, and posts a plain-language comment explaining that the task will resume automatically when its dependencies finish. The issue then self-resumes through the normal `issue_blockers_resolved` path; no recovery action or escalation owner is involved
 - if the issue has no waiting target, the park is indistinguishable from a genuine strand and falls through to the standard §9.2 escalation, preserving stranded detection
+
+An accepted interaction supersedes a continuation park recorded before that acceptance. A queued continuation carrying a parseable `interactionResolvedAt` must not be cancelled solely because an older continuation summary says to wait for review or approval. Interaction-continuation recovery is bounded: after three consecutive continuation wakes are cancelled without a run starting, recovery converts a real dependency wait when one exists or escalates the missing execution path visibly instead of requeueing forever.
 
 This keeps the post-decomposition umbrella (§7) on a real waiting path instead of relying on `parentId` rollup, which §6 does not treat as a dependency.
 
@@ -524,15 +599,39 @@ Automatic retries that can continue source work must use the original/normal mod
 
 Startup recovery and periodic recovery are different from normal wakeup delivery.
 
-On startup and on the periodic recovery loop, Paperclip now does five things in sequence:
+On startup and on the periodic recovery loop, Paperclip uses one ordered chain:
 
 1. reap orphaned `running` runs
-2. resume persisted `queued` runs
-3. reconcile stranded assigned work
-4. scan silent active runs, revalidate their source issues, and either fold source-resolved watchdogs or create/update explicit watchdog recovery actions
-5. reconcile productivity reviews
+2. promote due scheduled retries
+3. resume persisted `queued` runs
+4. reconcile stranded assigned work
+5. reconcile issue-graph liveness
+6. evaluate priority delivery-control SLA/liveness deltas
+7. reconcile task watchdogs
+8. scan silent active runs, revalidate their source issues, and either fold source-resolved watchdogs or create/update explicit watchdog recovery actions
+9. sweep stale issue locks
+10. reconcile productivity reviews
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output. The productivity-review pass is later and separate; it reviews unusual progression patterns on assigned source issues, not stale run handles after a source issue already has a valid disposition.
+
+### Priority delivery control
+
+The priority delivery-control contract id is `paperclip.delivery-control`, version `1.0.0`, and it requires lifecycle contract `paperclip.issue-lifecycle-execution` version `1.0.0` or newer. It applies to `critical` and `high` issues and measures the instruction/unblock trigger, queue entry, run start, progress, and result as separate audit timestamps.
+
+The accepted limits are:
+
+| Priority | Start SLA | Recovery due | Escalation due | Communication maximum gap |
+| --- | ---: | ---: | ---: | ---: |
+| `critical` | 5 minutes | 15 minutes | 30 minutes | 30 minutes |
+| `high` | 15 minutes | 30 minutes | 60 minutes | 2 hours |
+
+Start-SLA risk begins at 80% of the limit. A queued wake counts as covered only before the start deadline and only when queue capacity is available. An active run counts as live only while it has recent progress, owns a coherent issue execution lock, and has no orphaned resource lock. Comments, unmanaged processes, and a human assignee without a scheduled next check remain evidence only. `scheduled_retry`, a future monitor, a fresh typed review/approval, a healthy explicit `blocks` dependency path, or an explicit recovery action with a future check are durable covered paths.
+
+Automatic recovery is capped at two attempt-scoped wakes. Exhaustion requires a first-class blocker/recovery surface. Critical-path propagation follows explicit `blocks` edges only, never `parentId`, and reports dependency depth beyond three or cycles instead of recursing indefinitely. The incident lane admits at most three active technical packages.
+
+Rollout is `off | shadow | enforce`, defaults to `shadow`, and `enforce` is selected only for company ids in `PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS`. An optional `PAPERCLIP_DELIVERY_CONTROL_ISSUE_IDS` list narrows enforcement further during the first canary while every other eligible issue in the allowlisted company remains in shadow; an empty issue list means the whole allowlisted company. Shadow writes deduplicated, machine-readable observations without changing delivery state. For allowlisted issue scopes, enforce uses the same evaluation contract to propagate critical-path priority, enqueue at most two attempt-scoped recovery wakes, create one source-scoped CEO escalation, persist a first-class exhausted blocker, resolve recovered actions, and emit delta-only communication. A dependency-blocked issue accepts that recovery wake only in bounded interaction mode and only after the persisted active recovery action is revalidated against the exact company, issue, assignee, cause, and timeout; normal and forged wakes remain blocked. If the current assignee is already the CEO, the escalation is recorded against the existing assignee recovery instead of enqueueing a duplicate CEO run. Each issue is isolated so one failed reconciliation does not stop the remaining scan.
+
+User-facing communication is delta-based. A phase change, real blocker, SLA risk, user decision, live acceptance, or long-run progress delta may emit an update only when `completed`, `currentAction`, `remaining`, `owner`, and `nextCheckAt` are present. A stable issue/reason/delta key suppresses duplicates; elapsed time without a state or progress delta does not produce a heartbeat message.
 
 ## 11. Task Watchdog for Issue Trees
 
@@ -723,7 +822,7 @@ Paperclip still does not:
 The recovery model is intentionally conservative:
 
 - preserve ownership
-- retry once when the control plane lost execution continuity
+- retry at most twice when the control plane lost execution continuity
 - open an explicit recovery action when the system can identify a bounded recovery owner/action
 - escalate visibly when the system cannot safely keep going
 

@@ -1,10 +1,24 @@
 import { describe, expect, it } from "vitest";
 import {
+  resolveAutomationIssueCreatedAtCutoff,
   resolveHeartbeatSchedulingSuppression,
   resolveSkillTestRunCompletionForHeartbeatOutcome,
 } from "../services/heartbeat.ts";
 
 describe("heartbeat scheduling suppression", () => {
+  it("parses the optional automatic-execution issue cutoff", () => {
+    expect(resolveAutomationIssueCreatedAtCutoff({})).toBeNull();
+    expect(resolveAutomationIssueCreatedAtCutoff({
+      PAPERCLIP_AUTOMATION_ISSUE_CREATED_AT_CUTOFF: "2026-07-16T16:00:00.000Z",
+    })?.toISOString()).toBe("2026-07-16T16:00:00.000Z");
+  });
+
+  it("fails closed on an invalid automatic-execution issue cutoff", () => {
+    expect(() => resolveAutomationIssueCreatedAtCutoff({
+      PAPERCLIP_AUTOMATION_ISSUE_CREATED_AT_CUTOFF: "not-a-date",
+    })).toThrow(/valid ISO-8601 timestamp/);
+  });
+
   it("suppresses heartbeat scheduling for worktree runtimes", () => {
     expect(resolveHeartbeatSchedulingSuppression({
       PAPERCLIP_IN_WORKTREE: "true",

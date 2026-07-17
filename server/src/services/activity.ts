@@ -18,6 +18,7 @@ import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { classifyRunLiveness } from "./run-liveness.js";
+import { listResourceQueueTelemetry } from "./resource-control-leases.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -432,6 +433,7 @@ export function activityService(db: Db) {
       if (runs.length === 0) return runs;
       const runIds = runs.map((run) => run.runId);
       if (runIds.length === 0) return runs;
+      const resourceQueueTelemetryByRunId = await listResourceQueueTelemetry(db, companyId, runIds);
 
       const exhaustionRows = await db
         .select({
@@ -491,6 +493,7 @@ export function activityService(db: Db) {
               : null;
         return {
           ...run,
+          resourceQueueTelemetry: resourceQueueTelemetryByRunId.get(run.runId) ?? null,
           environment: leaseRow
             ? {
                 id: leaseRow.environment.id,

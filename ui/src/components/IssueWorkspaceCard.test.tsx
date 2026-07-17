@@ -213,6 +213,125 @@ describe("IssueWorkspaceCard", () => {
     });
   });
 
+  it("edits Project default as inherit instead of shared workspace", () => {
+    const root = createRoot(container);
+    const onUpdate = vi.fn();
+
+    useQueryMock.mockImplementation((options: { queryKey: unknown[] }) => {
+      if (options.queryKey[0] === "instance") {
+        return { data: { enableEnvironments: false, enableIsolatedWorkspaces: true } };
+      }
+      if (options.queryKey[0] === "execution-workspaces") {
+        return { data: [] };
+      }
+      return { data: undefined };
+    });
+
+    act(() => {
+      root.render(
+        <IssueWorkspaceCard
+          issue={createIssue({
+            executionWorkspaceId: null,
+            executionWorkspacePreference: "inherit",
+            executionWorkspaceSettings: { mode: "inherit" },
+            currentExecutionWorkspace: null,
+          })}
+          project={{
+            id: "project-1",
+            executionWorkspacePolicy: {
+              enabled: true,
+              defaultMode: "isolated_workspace",
+            },
+          }}
+          onUpdate={onUpdate}
+          initialEditing
+        />,
+      );
+    });
+
+    const workspaceSelect = container.querySelector("select");
+    expect(workspaceSelect?.value).toBe("inherit");
+    expect(workspaceSelect?.textContent).toContain("Project default (New isolated workspace)");
+    expect(workspaceSelect?.textContent).toContain("Shared workspace");
+
+    const saveButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Save"));
+    act(() => {
+      saveButton?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+
+    expect(onUpdate).toHaveBeenCalledWith({
+      executionWorkspacePreference: "inherit",
+      executionWorkspaceId: null,
+      executionWorkspaceSettings: {
+        mode: "inherit",
+        environmentId: null,
+      },
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("normalizes issue-level workspace choices when the project policy is locked", () => {
+    const root = createRoot(container);
+    const onUpdate = vi.fn();
+
+    useQueryMock.mockImplementation((options: { queryKey: unknown[] }) => {
+      if (options.queryKey[0] === "instance") {
+        return { data: { enableEnvironments: false, enableIsolatedWorkspaces: true } };
+      }
+      if (options.queryKey[0] === "execution-workspaces") {
+        return { data: [] };
+      }
+      return { data: undefined };
+    });
+
+    act(() => {
+      root.render(
+        <IssueWorkspaceCard
+          issue={createIssue({
+            executionWorkspaceId: null,
+            executionWorkspacePreference: "shared_workspace",
+            executionWorkspaceSettings: { mode: "shared_workspace" },
+            currentExecutionWorkspace: null,
+          })}
+          project={{
+            id: "project-1",
+            executionWorkspacePolicy: {
+              enabled: true,
+              defaultMode: "isolated_workspace",
+              allowIssueOverride: false,
+            },
+          }}
+          onUpdate={onUpdate}
+          initialEditing
+        />,
+      );
+    });
+
+    const workspaceSelect = container.querySelector("select");
+    expect(workspaceSelect?.value).toBe("inherit");
+    expect(workspaceSelect?.textContent).toContain("Project default (New isolated workspace)");
+    expect(workspaceSelect?.textContent).not.toContain("Shared workspace");
+
+    const saveButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Save"));
+    act(() => {
+      saveButton?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+
+    expect(onUpdate).toHaveBeenCalledWith({
+      executionWorkspacePreference: "inherit",
+      executionWorkspaceId: null,
+      executionWorkspaceSettings: {
+        mode: "inherit",
+        environmentId: null,
+      },
+    });
+
+    act(() => root.unmount());
+  });
+
   it("hides environment UI when environments are disabled", () => {
     const root = createRoot(container);
 

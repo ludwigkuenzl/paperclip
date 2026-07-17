@@ -2989,6 +2989,135 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("reuses the sole implementation blocker workspace for a review child while preserving review resource controls", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const implementationIssueId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Implementation worktree",
+      status: "active",
+      providerType: "git_worktree",
+    });
+
+    await db.insert(issues).values([
+      {
+        id: parentIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Parent issue",
+        status: "in_progress",
+        priority: "medium",
+      },
+      {
+        id: implementationIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        parentId: parentIssueId,
+        title: "Implementation issue",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          resourceControl: {
+            actionClass: "isolated_write",
+            resourceKey: "worktree:implementation",
+          },
+        },
+      },
+    ]);
+
+    const review = await svc.create(companyId, {
+      projectId,
+      parentId: parentIssueId,
+      blockedByIssueIds: [implementationIssueId],
+      title: "Review issue",
+      status: "todo",
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        resourceControl: {
+          actionClass: "review",
+          resourceKey: "worktree:implementation",
+        },
+      },
+    });
+
+    expect(review.parentId).toBe(parentIssueId);
+    expect(review.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(review.executionWorkspacePreference).toBe("reuse_existing");
+    expect(review.executionWorkspaceSettings).toEqual({
+      mode: "isolated_workspace",
+      resourceControl: {
+        actionClass: "review",
+        resourceKey: "worktree:implementation",
+      },
+    });
+  });
+
+  it("fails closed when reuse_existing cannot resolve an execution workspace", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await expect(svc.create(companyId, {
+      title: "Review without a source workspace",
+      status: "todo",
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        resourceControl: {
+          actionClass: "review",
+          resourceKey: "worktree:missing",
+        },
+      },
+    })).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("reuse_existing requires"),
+    });
+  });
+
   it("createChild applies parent defaults, acceptance criteria, workspace inheritance, and optional parent blocker chaining", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

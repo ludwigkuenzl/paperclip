@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
+  createChildIssueSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
   resolveIssueRecoveryActionSchema,
@@ -64,6 +65,53 @@ describe("issue validators", () => {
     expect(created.responsibleUserId).toBe("spoofed-responsible");
     expect(updated).not.toHaveProperty("createdByUserId");
     expect(updated).not.toHaveProperty("responsibleUserId");
+  });
+
+  it("accepts explicit resource-control metadata and rejects incomplete resource identities", () => {
+    const parsed = createIssueSchema.parse({
+      title: "Deploy one versioned release",
+      executionWorkspaceSettings: {
+        mode: "operator_branch",
+        resourceControl: {
+          actionClass: "deploy",
+          resourceKey: "vps:production",
+          changeId: "sha-123",
+          idempotencyKey: "deploy:production:sha-123",
+        },
+      },
+    });
+    expect(parsed.executionWorkspaceSettings?.resourceControl).toMatchObject({
+      actionClass: "deploy",
+      resourceKey: "vps:production",
+      changeId: "sha-123",
+    });
+    expect(createIssueSchema.safeParse({
+      title: "Missing resource key",
+      executionWorkspaceSettings: {
+        resourceControl: { actionClass: "external_action", resourceKey: "" },
+      },
+    }).success).toBe(false);
+  });
+
+  it("preserves an explicit workspace inheritance source for review child issues", () => {
+    const sourceIssueId = "80f04971-ed4f-4d8e-95c8-6a7d8a9ae3b4";
+    const parsed = createChildIssueSchema.parse({
+      title: "Review unpublished implementation",
+      inheritExecutionWorkspaceFromIssueId: sourceIssueId,
+      blockedByIssueIds: [sourceIssueId],
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        resourceControl: {
+          actionClass: "review",
+          resourceKey: "worktree:paperclip/GLA-1505",
+        },
+      },
+    });
+
+    expect(parsed.inheritExecutionWorkspaceFromIssueId).toBe(sourceIssueId);
+    expect(parsed.blockedByIssueIds).toEqual([sourceIssueId]);
+    expect(parsed.executionWorkspacePreference).toBe("reuse_existing");
   });
 
   it("allows false-positive recovery resolutions to atomically restore the source issue status", () => {

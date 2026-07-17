@@ -1,4 +1,5 @@
 import type {
+  DeliveryControlResourceQueueTelemetry,
   HeartbeatRun,
   HeartbeatRunEvent,
   InstanceSchedulerHeartbeatAgent,
@@ -41,6 +42,7 @@ export interface ActiveRunForIssue {
   currentToolName?: string | null;
   lastAssistantSnippet?: string | null;
   lastEventAt?: string | Date | null;
+  resourceQueueTelemetry?: DeliveryControlResourceQueueTelemetry | null;
 }
 
 export interface LiveRunForIssue {
@@ -70,6 +72,7 @@ export interface LiveRunForIssue {
   currentToolName?: string | null;
   lastAssistantSnippet?: string | null;
   lastEventAt?: string | null;
+  resourceQueueTelemetry?: DeliveryControlResourceQueueTelemetry | null;
 }
 
 export interface WatchdogDecisionInput {

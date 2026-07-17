@@ -9,6 +9,8 @@ import { ExternalLink, Square } from "lucide-react";
 import { Identity } from "./Identity";
 import { RunChatSurface } from "./RunChatSurface";
 import { StatusBadge } from "./StatusBadge";
+import { QueueTelemetryDetails, RunQueueWaitBadge } from "./RunQueueWait";
+import { isRunLive, isRunQueued, isRunWatched } from "../lib/run-queue-status";
 import { useLiveRunTranscripts } from "./transcript/useLiveRunTranscripts";
 
 interface LiveRunWidgetProps {
@@ -22,7 +24,7 @@ function toIsoString(value: string | Date | null | undefined): string | null {
 }
 
 function isRunActive(status: string): boolean {
-  return status === "queued" || status === "running";
+  return isRunWatched(status);
 }
 
 export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
@@ -67,6 +69,7 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
         logBytes: activeRun.logBytes,
         lastOutputBytes: activeRun.lastOutputBytes,
         issueId,
+        resourceQueueTelemetry: activeRun.resourceQueueTelemetry,
       });
     }
     return [...deduped.values()].sort(
@@ -75,6 +78,15 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
   }, [activeRun, issueId, liveRuns]);
 
   const { transcriptByRun, hasOutputForRun } = useLiveRunTranscripts({ runs, companyId });
+  const hasLiveRun = runs.some((run) => isRunLive(run.status));
+  const hasQueuedRun = runs.some((run) => isRunQueued(run.status));
+  const heading = hasLiveRun
+    ? hasQueuedRun
+      ? "Live and Queued Runs"
+      : "Live Runs"
+    : hasQueuedRun
+      ? "Queued Runs"
+      : "Recent Runs";
 
   const handleCancelRun = async (runId: string) => {
     setCancellingRunIds((prev) => new Set(prev).add(runId));
@@ -94,10 +106,19 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
   if (runs.length === 0) return null;
 
   return (
-    <div className="overflow-hidden rounded-xl border border-blue-500/25 bg-background/80 shadow-(--shadow-extract-11)">
-      <div className="border-b border-border/60 bg-blue-500/[0.04] px-4 py-3">
-        <div className="text-xs font-semibold uppercase tracking-(--tracking-caps) text-blue-700 dark:text-blue-300">
-          Live Runs
+    <div className={hasLiveRun
+      ? "overflow-hidden rounded-xl border border-blue-500/25 bg-background/80 shadow-(--shadow-extract-11)"
+      : "overflow-hidden rounded-xl border border-amber-500/30 bg-background/80 shadow-(--shadow-extract-11)"
+    }>
+      <div className={hasLiveRun
+        ? "border-b border-border/60 bg-blue-500/[0.04] px-4 py-3"
+        : "border-b border-border/60 bg-amber-500/[0.04] px-4 py-3"
+      }>
+        <div className={hasLiveRun
+          ? "text-xs font-semibold uppercase tracking-(--tracking-caps) text-blue-700 dark:text-blue-300"
+          : "text-xs font-semibold uppercase tracking-(--tracking-caps) text-amber-700 dark:text-amber-300"
+        }>
+          {heading}
         </div>
         <div className="mt-1 text-xs text-muted-foreground">
           Uses the shared chat-style run surface from task activity.
@@ -123,6 +144,7 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
                       {run.id.slice(0, 8)}
                     </Link>
                     <StatusBadge status={run.status} />
+                    <RunQueueWaitBadge status={run.status} telemetry={run.resourceQueueTelemetry} />
                     <span>{formatDateTime(run.startedAt ?? run.createdAt)}</span>
                   </div>
                 </div>
@@ -147,6 +169,12 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
                   </Link>
                 </div>
               </div>
+
+              {run.resourceQueueTelemetry ? (
+                <div className="mb-3">
+                  <QueueTelemetryDetails telemetry={run.resourceQueueTelemetry} />
+                </div>
+              ) : null}
 
               <div className="max-h-(--sz-320px) overflow-y-auto pr-1">
                 <RunChatSurface

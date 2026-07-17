@@ -18,6 +18,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueRecoveryActions,
   issueRelations,
   issueTreeHolds,
   issues,
@@ -131,6 +132,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(companySkills);
     await db.delete(issueComments);
     await db.delete(issueDocuments);
+    await db.delete(issueRecoveryActions);
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issueRelations);
@@ -163,6 +165,212 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("reads only company-, issue-, and agent-scoped live execution paths", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const retryIssueId = randomUUID();
+    const wakeIssueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Execution Path Co",
+      issuePrefix: `E${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "ExecutionOwner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "OtherAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      contextSnapshot: { issueId: retryIssueId },
+      scheduledRetryAt: new Date(Date.now() + 60_000),
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: wakeIssueId },
+      status: "deferred_issue_execution",
+    });
+
+    await expect(heartbeat.getIssueExecutionPath(companyId, retryIssueId, agentId)).resolves.toMatchObject({
+      kind: "run",
+      status: "scheduled_retry",
+      agentId,
+    });
+    await expect(heartbeat.getIssueExecutionPath(companyId, wakeIssueId, agentId)).resolves.toMatchObject({
+      kind: "wake",
+      status: "deferred_issue_execution",
+      agentId,
+    });
+    await expect(heartbeat.getIssueExecutionPath(companyId, retryIssueId, otherAgentId)).resolves.toBeNull();
+    await expect(heartbeat.getIssueExecutionPath(randomUUID(), retryIssueId, agentId)).resolves.toBeNull();
+  });
+
+  it("enqueues one company-scoped dependency execution for concurrent same- and cross-agent callers", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const competingAgentId = randomUUID();
+    const blockerId = randomUUID();
+    const dependentIssueId = randomUUID();
+    const idempotencyKey = `issue_blockers_resolved:${dependentIssueId}:${blockerId}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "DependencyWorker",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 1,
+          },
+        },
+        permissions: {},
+      },
+      {
+        id: competingAgentId,
+        companyId,
+        name: "ReassignedDependencyWorker",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 1,
+          },
+        },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: dependentIssueId,
+      companyId,
+      title: "Resume after final blocker",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+
+    let finishRun!: () => void;
+    const runCanFinish = new Promise<void>((resolve) => {
+      finishRun = resolve;
+    });
+    mockAdapterExecute.mockImplementation(async () => {
+      await runCanFinish;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Concurrent dependency wake completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const wakeOptions = {
+      source: "automation" as const,
+      triggerDetail: "system" as const,
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: dependentIssueId,
+        resolvedBlockerIssueId: blockerId,
+      },
+      contextSnapshot: {
+        issueId: dependentIssueId,
+        wakeReason: "issue_blockers_resolved",
+        resolvedBlockerIssueId: blockerId,
+      },
+      idempotencyKey,
+    };
+
+    const [firstRun, secondRun, crossAgentRun] = await Promise.all([
+      heartbeat.wakeup(agentId, wakeOptions),
+      heartbeat.wakeup(agentId, wakeOptions),
+      heartbeat.wakeup(competingAgentId, wakeOptions),
+    ]);
+
+    expect(firstRun).not.toBeNull();
+    expect(secondRun?.id).toBe(firstRun?.id);
+    expect(crossAgentRun?.id).toBe(firstRun?.id);
+    const wakeRequests = await db
+      .select({ id: agentWakeupRequests.id, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ),
+      );
+    expect(wakeRequests).toHaveLength(1);
+    expect(wakeRequests[0]?.runId).toBe(firstRun?.id);
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: dependentIssueId,
+      authorAgentId: firstRun!.agentId,
+      authorType: "agent",
+      createdByRunId: firstRun!.id,
+      body: "Concurrent dependency wake completed.",
+    });
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: new Date() })
+      .where(eq(issues.id, dependentIssueId));
+    finishRun();
+
+    expect(await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, firstRun!.id))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    })).toBe(true);
   });
 
   it("keeps blocked descendants idle until their blockers resolve", async () => {
@@ -268,6 +476,81 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${blockedIssueId}`)
       .then((rows) => rows[0]?.count ?? 0);
     expect(blockedRunsBeforeResolution).toBe(0);
+
+    const recoveryActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "issue_graph_liveness",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "delivery_control_liveness",
+      fingerprint: "delivery-control-dependency-recovery",
+      evidence: {},
+      nextAction: "Restore an executable dependency or monitor path.",
+      attemptCount: 1,
+      maxAttempts: 2,
+      timeoutAt: new Date(Date.now() + 60_000),
+      lastAttemptAt: new Date(),
+    });
+
+    const forgedRecoveryWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assignment_recovery",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        wakeReason: "issue_assignment_recovery",
+        retryReason: "delivery_control_liveness",
+        source: "delivery_control.reconcile",
+        recoveryActionId: randomUUID(),
+      },
+    });
+    expect(forgedRecoveryWake).toBeNull();
+
+    const recoveryWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assignment_recovery",
+      payload: { issueId: blockedIssueId, recoveryActionId },
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        wakeReason: "issue_assignment_recovery",
+        retryReason: "delivery_control_liveness",
+        source: "delivery_control.reconcile",
+        recoveryActionId,
+      },
+    });
+    expect(recoveryWake).not.toBeNull();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, recoveryWake!.id))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const recoveryRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, recoveryWake!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryRun?.status).toBe("succeeded");
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      dependencyBlockedInteraction: true,
+      dependencyBlockedRecovery: true,
+      unresolvedBlockerIssueIds: [blockerId],
+    });
 
     const interactionWake = await heartbeat.wakeup(agentId, {
       source: "automation",
@@ -487,7 +770,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     });
 
     const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerId}`;
-    const wake = await heartbeat.wakeup(agentId, {
+    const wakeOptions = {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_blockers_resolved",
@@ -501,9 +784,14 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         wakeReason: "issue_blockers_resolved",
         resolvedBlockerIssueId: blockerId,
       },
-    });
+    } as const;
+    const [firstWake, concurrentWake] = await Promise.all([
+      heartbeat.wakeup(agentId, wakeOptions),
+      heartbeat.wakeup(agentId, wakeOptions),
+    ]);
 
-    expect(wake).toBeNull();
+    expect(firstWake).toBeNull();
+    expect(concurrentWake).toBeNull();
 
     const wakeRequests = await db
       .select({
@@ -679,6 +967,552 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       finishFirstRun();
     }
   }, 40_000);
+
+  it("atomically starts only one assigned run for the same issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+    let finishFirstRun!: () => void;
+    const firstRunFinished = new Promise<void>((resolve) => {
+      finishFirstRun = resolve;
+    });
+
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await firstRunFinished;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "First same-issue run completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Atomic Issue Claim",
+      issuePrefix: `A${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "AtomicWorker",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "One issue, one executing owner",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: firstRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        createdAt: new Date("2026-07-15T00:00:00.000Z"),
+        updatedAt: new Date("2026-07-15T00:00:00.000Z"),
+      },
+      {
+        id: secondRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        createdAt: new Date("2026-07-15T00:00:01.000Z"),
+        updatedAt: new Date("2026-07-15T00:00:01.000Z"),
+      },
+    ]);
+    await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: firstRunId,
+        body: "First same-issue run completed.",
+      },
+      {
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: secondRunId,
+        body: "Second same-issue run completed.",
+      },
+    ]);
+
+    try {
+      await heartbeat.resumeQueuedRuns();
+      const firstStarted = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, firstRunId));
+        return run?.status === "running";
+      });
+      expect(firstStarted).toBe(true);
+
+      const [secondWhileFirstRuns] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, secondRunId));
+      const [issueWhileFirstRuns] = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(secondWhileFirstRuns?.status).toBe("queued");
+      expect(issueWhileFirstRuns?.executionRunId).toBe(firstRunId);
+      const callsForRun = (runId: string) => mockAdapterExecute.mock.calls.filter(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
+      );
+      const firstAdapterStarted = await waitForCondition(async () => callsForRun(firstRunId).length === 1);
+      expect(firstAdapterStarted).toBe(true);
+
+      finishFirstRun();
+      const secondSucceeded = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, secondRunId));
+        return run?.status === "succeeded";
+      }, 10_000);
+      expect(secondSucceeded).toBe(true);
+      expect(callsForRun(firstRunId)).toHaveLength(1);
+      expect(callsForRun(secondRunId)).toHaveLength(1);
+    } finally {
+      finishFirstRun();
+    }
+  }, 40_000);
+
+  it("serializes the same explicit resource while allowing different issues to queue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const firstIssueId = randomUUID();
+    const secondIssueId = randomUUID();
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+    let finishFirstRun!: () => void;
+    const firstRunFinished = new Promise<void>((resolve) => {
+      finishFirstRun = resolve;
+    });
+
+    mockAdapterExecute.mockImplementation(async (input: { runId: string }) => {
+      if (input.runId === firstRunId) await firstRunFinished;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: `Resource-controlled run ${input.runId} completed.`,
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Resource Claim",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ResourceWorker",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: firstIssueId,
+        companyId,
+        title: "Deploy first change",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        executionWorkspaceSettings: {
+          resourceControl: {
+            actionClass: "deploy",
+            resourceKey: "deploy:production",
+            changeId: "sha-first",
+            idempotencyKey: "deploy-production-sha-first",
+          },
+        },
+      },
+      {
+        id: secondIssueId,
+        companyId,
+        title: "Deploy second change",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        executionWorkspaceSettings: {
+          resourceControl: {
+            actionClass: "deploy",
+            resourceKey: "deploy:production",
+            changeId: "sha-second",
+            idempotencyKey: "deploy-production-sha-second",
+          },
+        },
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: firstRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId: firstIssueId, wakeReason: "issue_assigned" },
+        createdAt: new Date("2026-07-15T00:00:00.000Z"),
+        updatedAt: new Date("2026-07-15T00:00:00.000Z"),
+      },
+      {
+        id: secondRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId: secondIssueId, wakeReason: "issue_assigned" },
+        createdAt: new Date("2026-07-15T00:00:01.000Z"),
+        updatedAt: new Date("2026-07-15T00:00:01.000Z"),
+      },
+    ]);
+    await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId: firstIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: firstRunId,
+        body: "First resource-controlled run completed.",
+      },
+      {
+        companyId,
+        issueId: secondIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: secondRunId,
+        body: "Second resource-controlled run completed.",
+      },
+    ]);
+
+    try {
+      await heartbeat.resumeQueuedRuns();
+      const firstStarted = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, firstRunId));
+        return run?.status === "running";
+      });
+      expect(firstStarted).toBe(true);
+      const firstAdapterStarted = await waitForCondition(async () => mockAdapterExecute.mock.calls.some(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === firstRunId,
+      ));
+      expect(firstAdapterStarted).toBe(true);
+      const firstAdapterContext = mockAdapterExecute.mock.calls.find(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === firstRunId,
+      )?.[0] as {
+        context?: { paperclipResourceControl?: Record<string, unknown> };
+        config?: { env?: Record<string, string> };
+      } | undefined;
+      expect(firstAdapterContext?.context?.paperclipResourceControl).toMatchObject({
+        actionClass: "deploy",
+        resourceKey: "deploy:production",
+        changeId: "sha-first",
+        fencingToken: 1,
+      });
+      expect(firstAdapterContext?.config?.env).toMatchObject({
+        PAPERCLIP_RESOURCE_KEY: "deploy:production",
+        PAPERCLIP_RESOURCE_CHANGE_ID: "sha-first",
+        PAPERCLIP_RESOURCE_FENCING_TOKEN: "1",
+      });
+      const [waiting] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, secondRunId));
+      expect(waiting?.status).toBe("queued");
+      expect(mockAdapterExecute.mock.calls.filter(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === secondRunId,
+      )).toHaveLength(0);
+
+      finishFirstRun();
+      const secondSucceeded = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, secondRunId));
+        return run?.status === "succeeded";
+      }, 10_000);
+      expect(secondSucceeded).toBe(true);
+      expect(mockAdapterExecute.mock.calls.filter(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === secondRunId,
+      )).toHaveLength(1);
+    } finally {
+      finishFirstRun();
+    }
+  }, 40_000);
+
+  it("denies an exclusive resource action for a non-assignee mention run", async () => {
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const mentionedAgentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Resource Ownership",
+      issuePrefix: `O${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: ownerAgentId,
+        companyId,
+        name: "DeployOwner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: mentionedAgentId,
+        companyId,
+        name: "MentionedReviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Owner-only deployment",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: ownerAgentId,
+      responsibleUserId: "responsible-user",
+      executionWorkspaceSettings: {
+        resourceControl: {
+          actionClass: "deploy",
+          resourceKey: "deploy:production",
+          changeId: "sha-owner-only",
+          idempotencyKey: "deploy-production-sha-owner-only",
+        },
+      },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: mentionedAgentId,
+      invocationSource: "mention",
+      triggerDetail: "agent_mention",
+      status: "queued",
+      contextSnapshot: { issueId, commentId: randomUUID(), wakeReason: "issue_comment_mentioned" },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    const denied = await waitForCondition(async () => {
+      const [run] = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      return run?.status === "cancelled" && run.errorCode === "resource_control_denied";
+    });
+    expect(denied).toBe(true);
+    expect(mockAdapterExecute.mock.calls.filter(
+      (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
+    )).toHaveLength(0);
+  });
+
+  it("fails closed for inferred shared writes only inside the resource-control company canary", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const previousMode = process.env.PAPERCLIP_RESOURCE_CONTROL_MODE;
+    const previousCompanies = process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS;
+    process.env.PAPERCLIP_RESOURCE_CONTROL_MODE = "enforce";
+    process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS = companyId;
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Shared Write Canary",
+        issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "SharedWriter",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Unscoped shared mutation",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+
+      await heartbeat.resumeQueuedRuns();
+      const denied = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        return run?.status === "cancelled" && run.errorCode === "resource_control_denied";
+      });
+      expect(denied).toBe(true);
+      expect(mockAdapterExecute.mock.calls.filter(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
+      )).toHaveLength(0);
+    } finally {
+      if (previousMode === undefined) delete process.env.PAPERCLIP_RESOURCE_CONTROL_MODE;
+      else process.env.PAPERCLIP_RESOURCE_CONTROL_MODE = previousMode;
+      if (previousCompanies === undefined) delete process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS;
+      else process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS = previousCompanies;
+    }
+  });
+
+  it("does not let delivery-control enforcement activate inferred resource-control denial", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const previousDeliveryMode = process.env.PAPERCLIP_DELIVERY_CONTROL_MODE;
+    const previousDeliveryCompanies = process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS;
+    const previousResourceMode = process.env.PAPERCLIP_RESOURCE_CONTROL_MODE;
+    const previousResourceCompanies = process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS;
+    process.env.PAPERCLIP_DELIVERY_CONTROL_MODE = "enforce";
+    process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS = companyId;
+    process.env.PAPERCLIP_RESOURCE_CONTROL_MODE = "shadow";
+    process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS = companyId;
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Independent Delivery Canary",
+        issuePrefix: `I${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "IndependentWriter",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Existing inferred shared work",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: runId,
+        body: "Existing shared work completed without resource-control opt-in.",
+      });
+
+      await heartbeat.resumeQueuedRuns();
+      const succeeded = await waitForCondition(async () => {
+        const [run] = await db
+          .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        return run?.status === "succeeded" && run.errorCode == null;
+      }, 10_000);
+      expect(succeeded).toBe(true);
+      expect(mockAdapterExecute.mock.calls.some(
+        (call) => (call[0] as { runId?: string } | undefined)?.runId === runId,
+      )).toBe(true);
+    } finally {
+      if (previousDeliveryMode === undefined) delete process.env.PAPERCLIP_DELIVERY_CONTROL_MODE;
+      else process.env.PAPERCLIP_DELIVERY_CONTROL_MODE = previousDeliveryMode;
+      if (previousDeliveryCompanies === undefined) delete process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS;
+      else process.env.PAPERCLIP_DELIVERY_CONTROL_COMPANY_IDS = previousDeliveryCompanies;
+      if (previousResourceMode === undefined) delete process.env.PAPERCLIP_RESOURCE_CONTROL_MODE;
+      else process.env.PAPERCLIP_RESOURCE_CONTROL_MODE = previousResourceMode;
+      if (previousResourceCompanies === undefined) delete process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS;
+      else process.env.PAPERCLIP_RESOURCE_CONTROL_COMPANY_IDS = previousResourceCompanies;
+    }
+  }, 20_000);
 
   it("cancels stale queued runs when issue blockers are still unresolved", async () => {
     const companyId = randomUUID();

@@ -12,7 +12,10 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRunIssueSummary: vi.fn(),
   getActiveRunIssueSummaryForAgent: vi.fn(),
   getRunLogAccess: vi.fn(),
+  getRun: vi.fn(),
+  listResourceQueueTelemetry: vi.fn(),
   readLog: vi.fn(),
+  resolveResourceControlRecoveryAfterReadback: vi.fn(),
   wakeup: vi.fn(),
 }));
 
@@ -222,6 +225,20 @@ describe("agent live run routes", () => {
       logStore: "local_file",
       logRef: "logs/run-1.ndjson",
     });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      status: "cancelled",
+    });
+    mockHeartbeatService.listResourceQueueTelemetry.mockResolvedValue(new Map());
+    mockHeartbeatService.resolveResourceControlRecoveryAfterReadback.mockResolvedValue({
+      id: "lease-1",
+      companyId: "company-1",
+      ownerRunId: "run-1",
+      resourceKey: "deploy:production",
+      status: "completed",
+    });
     mockHeartbeatService.readLog.mockResolvedValue({
       runId: "run-1",
       store: "local_file",
@@ -365,6 +382,51 @@ describe("agent live run routes", () => {
       content: "chunk",
       nextOffset: 5,
     });
+  });
+
+  it("resolves resource recovery only with explicit target readback fields", async () => {
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl)
+        .post("/api/heartbeat-runs/run-1/resource-control-recovery")
+        .send({
+          disposition: "completed",
+          observedChangeId: "sha-2",
+          observedFencingToken: 2,
+          readback: { deployedRevision: "sha-2", fencingToken: 2 },
+          reason: "Verified the production target.",
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.resolveResourceControlRecoveryAfterReadback).toHaveBeenCalledWith({
+      companyId: "company-1",
+      runId: "run-1",
+      disposition: "completed",
+      observedChangeId: "sha-2",
+      observedFencingToken: 2,
+      readback: { deployedRevision: "sha-2", fencingToken: 2 },
+      reason: "Verified the production target.",
+    });
+    expect(res.body).toMatchObject({ id: "lease-1", status: "completed" });
+  });
+
+  it("rejects resource recovery without non-empty target readback evidence", async () => {
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl)
+        .post("/api/heartbeat-runs/run-1/resource-control-recovery")
+        .send({
+          disposition: "not_applied",
+          observedChangeId: null,
+          observedFencingToken: null,
+          readback: {},
+          reason: "No target change observed.",
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(mockHeartbeatService.resolveResourceControlRecoveryAfterReadback).not.toHaveBeenCalled();
   });
 
   it("caps company live run polling by default", async () => {
