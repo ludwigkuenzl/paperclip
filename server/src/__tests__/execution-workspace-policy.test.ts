@@ -39,6 +39,43 @@ describe("execution workspace policy helpers", () => {
     ).toBe("isolated_workspace");
   });
 
+  it("enforces the project mode when issue overrides are disabled", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+        },
+        issueSettings: { mode: "shared_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("isolated_workspace");
+
+    expect(
+      buildExecutionWorkspaceAdapterConfig({
+        agentConfig: {},
+        projectPolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+          workspaceRuntime: { services: [{ name: "project-service" }] },
+        },
+        issueSettings: {
+          mode: "shared_workspace",
+          workspaceStrategy: { type: "project_primary" },
+          workspaceRuntime: { services: [{ name: "issue-service" }] },
+        },
+        mode: "isolated_workspace",
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toMatchObject({
+      workspaceStrategy: { type: "git_worktree", baseRef: "origin/main" },
+      workspaceRuntime: { services: [{ name: "project-service" }] },
+    });
+  });
+
   it("centralizes unrunnable isolated worktree detection", () => {
     expect(
       isUnrunnableWorktreeCombo({

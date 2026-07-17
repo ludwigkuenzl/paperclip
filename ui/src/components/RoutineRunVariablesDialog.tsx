@@ -35,6 +35,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  defaultExecutionWorkspaceSelectionForProject,
+  projectLocksExecutionWorkspaceSelection,
+} from "../lib/project-workspace-defaults";
 
 function buildInitialValues(variables: RoutineVariable[]) {
   return Object.fromEntries(variables.map((variable) => [variable.name, variable.defaultValue ?? ""]));
@@ -56,18 +60,6 @@ function defaultProjectWorkspaceIdForProject(project: Project | null | undefined
     ?? project.workspaces?.find((workspace) => workspace.isPrimary)?.id
     ?? project.workspaces?.[0]?.id
     ?? null;
-}
-
-function defaultExecutionWorkspaceModeForProject(project: Project | null | undefined): ExecutionWorkspaceMode {
-  const defaultMode = project?.executionWorkspacePolicy?.enabled ? project.executionWorkspacePolicy.defaultMode : null;
-  if (
-    defaultMode === "isolated_workspace" ||
-    defaultMode === "operator_branch" ||
-    defaultMode === "adapter_default"
-  ) {
-    return defaultMode === "adapter_default" ? "agent_default" : defaultMode;
-  }
-  return "shared_workspace";
 }
 
 function issueModeForExistingWorkspace(mode: string | null | undefined): ExecutionWorkspaceMode {
@@ -97,11 +89,15 @@ type RoutineRunWorkspaceConfig = {
   projectWorkspaceId: string | null;
 };
 
-function buildInitialWorkspaceConfig(
+export function buildInitialWorkspaceConfig(
   project: Project | null | undefined,
   defaultExecutionWorkspace?: ExecutionWorkspace | null,
 ): RoutineRunWorkspaceConfig {
-  if (defaultExecutionWorkspace && defaultExecutionWorkspace.projectId === project?.id) {
+  if (
+    !projectLocksExecutionWorkspaceSelection(project) &&
+    defaultExecutionWorkspace &&
+    defaultExecutionWorkspace.projectId === project?.id
+  ) {
     return {
       executionWorkspaceId: defaultExecutionWorkspace.id,
       executionWorkspacePreference: "reuse_existing",
@@ -112,7 +108,7 @@ function buildInitialWorkspaceConfig(
     };
   }
 
-  const defaultMode = defaultExecutionWorkspaceModeForProject(project);
+  const defaultMode = defaultExecutionWorkspaceSelectionForProject(project);
   return {
     executionWorkspaceId: null as string | null,
     executionWorkspacePreference: defaultMode,
@@ -264,12 +260,17 @@ export function RoutineRunVariablesDialog({
     setValues(buildInitialValues(variables));
     const nextSelection = buildInitialRunSelection({ defaultAssigneeAgentId, defaultProjectId });
     setSelection(nextSelection);
-    setWorkspaceConfig(buildInitialWorkspaceConfig(
+    const nextWorkspaceConfig = buildInitialWorkspaceConfig(
       projects.find((project) => project.id === nextSelection.projectId) ?? null,
       defaultExecutionWorkspace,
-    ));
+    );
+    setWorkspaceConfig(nextWorkspaceConfig);
     setWorkspaceConfigValid(true);
-    setWorkspaceBranchName(defaultExecutionWorkspace?.branchName ?? null);
+    setWorkspaceBranchName(
+      nextWorkspaceConfig.executionWorkspaceId === defaultExecutionWorkspace?.id
+        ? defaultExecutionWorkspace.branchName ?? null
+        : null,
+    );
   }, [defaultAssigneeAgentId, defaultExecutionWorkspace, defaultProjectId, open, projects, variables]);
 
   const workspaceBranchAutoValue = workspaceSelectionEnabled && workspaceBranchName

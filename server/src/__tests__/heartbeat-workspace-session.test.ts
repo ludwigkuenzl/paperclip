@@ -34,6 +34,7 @@ import {
   resolveWorkspaceAfterLowTrustPreflight,
   resolveRuntimeSessionParamsForWorkspace,
   shouldDeferFollowupWakeForSameIssue,
+  shouldReplaceIncompatibleLockedProjectWorkspaceReuse,
   stripHostWorkspaceProvisionForLowTrustSandbox,
   stripWorkspaceRuntimeFromExecutionRunConfig,
   shouldResetTaskSessionForModelChange,
@@ -1332,6 +1333,34 @@ describe("effective run execution workspace config freshness", () => {
     expect(metadata?.configFingerprint).not.toMatchObject({
       workspaceHash: next.fingerprint,
     });
+  });
+
+  it("reuses only policy-compatible workspaces when project overrides are locked", () => {
+    const base = {
+      projectPolicyLocked: true,
+      requestedShouldReuseExisting: true,
+      requestedMode: "isolated_workspace" as const,
+      requestedStrategyType: "git_worktree",
+      workspaceConfigFreshnessAction: "reuse" as const,
+    };
+
+    expect(shouldReplaceIncompatibleLockedProjectWorkspaceReuse({
+      ...base,
+      existingWorkspace: { mode: "isolated_workspace", strategyType: "git_worktree" },
+    })).toBe(false);
+    expect(shouldReplaceIncompatibleLockedProjectWorkspaceReuse({
+      ...base,
+      existingWorkspace: { mode: "shared_workspace", strategyType: "project_primary" },
+    })).toBe(true);
+    expect(shouldReplaceIncompatibleLockedProjectWorkspaceReuse({
+      ...base,
+      existingWorkspace: { mode: "isolated_workspace", strategyType: "git_worktree" },
+      workspaceConfigFreshnessAction: "replace",
+    })).toBe(true);
+    expect(shouldReplaceIncompatibleLockedProjectWorkspaceReuse({
+      ...base,
+      existingWorkspace: null,
+    })).toBe(true);
   });
 
   it("fails loudly when explicit reuse restore errors", async () => {
