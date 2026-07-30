@@ -126,13 +126,14 @@ export async function supersedeIssueBlockersResolvedWakesForBlocker(
     .filter(Boolean)
     .map((dependentIssueId) => `${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:${dependentIssueId}:`);
   const affected = rows.filter((row) => {
-    if (typeof row.idempotencyKey !== "string") return false;
-    if (!row.idempotencyKey.startsWith(`${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:`)) return false;
+    const key = row.idempotencyKey;
+    if (typeof key !== "string") return false;
+    if (!key.startsWith(`${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:`)) return false;
     // Dieser Vorgang war selbst der aufgeloeste Blocker.
-    if (row.idempotencyKey.endsWith(blockerMarker)) return true;
+    if (key.endsWith(blockerMarker)) return true;
     // Oder die Zeile gehoert zu einem seiner abhaengigen Vorgaenge und wurde von
     // einem anderen Blocker geschrieben.
-    return dependentPrefixes.some((prefix) => row.idempotencyKey.startsWith(prefix));
+    return dependentPrefixes.some((prefix) => key.startsWith(prefix));
   });
   if (affected.length === 0) return 0;
 
