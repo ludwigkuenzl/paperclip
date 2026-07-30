@@ -1092,7 +1092,16 @@ export async function startServer(): Promise<StartedServer> {
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-            .then(() => heartbeat.reconcileAgentRunningStatuses({ staleThresholdMs: 5 * 60 * 1000 }))
+            // Eigener catch: die Kette treibt danach promoteDueScheduledRetries,
+            // resumeQueuedRuns und reconcileStrandedAssignedIssues an. Ein Fehler
+            // in diesem Aufraeumschritt darf die eigentliche Ablaufsteuerung nicht
+            // mitreissen.
+            .then(() => heartbeat
+              .reconcileAgentRunningStatuses({ staleThresholdMs: 5 * 60 * 1000 })
+              .catch((err) => {
+                logger.warn({ err }, "periodic reconcile of stuck agent statuses failed");
+                return [];
+              }))
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
