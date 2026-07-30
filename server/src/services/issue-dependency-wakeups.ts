@@ -95,6 +95,17 @@ export async function supersedeIssueBlockersResolvedWakesForBlocker(
   input: {
     companyId: string;
     blockerIssueId: string;
+    /**
+     * Die abhaengigen Vorgaenge des Blockers. Die Live-Route prueft mit
+     * `findExistingIssueBlockersResolvedWakeForAnyKey` gegen *alle* Blocker-
+     * schluessel eines Vorgangs. Haengt ein Vorgang an mehreren Blockern, wuerde
+     * die erledigte Zeile eines anderen Blockers den Wake weiterhin
+     * unterdruecken. Verlaesst ein Blocker `done`, ist jeder seiner
+     * abhaengigen Vorgaenge wieder unfertig -- damit sind saemtliche
+     * Blocker-aufgeloest-Wakes dieser Vorgaenge veraltet, unabhaengig davon,
+     * welcher Blocker sie ausgeloest hat.
+     */
+    dependentIssueIds?: string[];
     supersededAt?: Date;
   },
 ) {
@@ -110,13 +121,19 @@ export async function supersedeIssueBlockersResolvedWakesForBlocker(
       ),
     );
 
-  const marker = `:${input.blockerIssueId}`;
-  const affected = rows.filter(
-    (row) =>
-      typeof row.idempotencyKey === "string" &&
-      row.idempotencyKey.startsWith(`${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:`) &&
-      row.idempotencyKey.endsWith(marker),
-  );
+  const blockerMarker = `:${input.blockerIssueId}`;
+  const dependentPrefixes = [...new Set(input.dependentIssueIds ?? [])]
+    .filter(Boolean)
+    .map((dependentIssueId) => `${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:${dependentIssueId}:`);
+  const affected = rows.filter((row) => {
+    if (typeof row.idempotencyKey !== "string") return false;
+    if (!row.idempotencyKey.startsWith(`${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:`)) return false;
+    // Dieser Vorgang war selbst der aufgeloeste Blocker.
+    if (row.idempotencyKey.endsWith(blockerMarker)) return true;
+    // Oder die Zeile gehoert zu einem seiner abhaengigen Vorgaenge und wurde von
+    // einem anderen Blocker geschrieben.
+    return dependentPrefixes.some((prefix) => row.idempotencyKey.startsWith(prefix));
+  });
   if (affected.length === 0) return 0;
 
   for (const row of affected) {

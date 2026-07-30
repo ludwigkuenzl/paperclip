@@ -11870,6 +11870,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  /**
+   * Setzt Agenten zurueck, die als `running` gefuehrt werden, obwohl kein
+   * laufender Run mehr existiert.
+   *
+   * `agents.status` wird beim Ausfuehrungsstart hart auf `running` gesetzt und
+   * erst im Abschlusspfad wieder aus der Zahl laufender Runs abgeleitet. Endet
+   * ein Lauf, ohne dort anzukommen -- Prozessverlust, Neustart, Abbruch im
+   * Rennen mit dem Start --, bleibt das Feld dauerhaft auf `running`. Der
+   * Run-Reaper raeumt nur die Laeufe auf, nicht dieses Feld; der Agent wirkt
+   * danach dauerhaft beschaeftigt, obwohl er nichts tut, und der Neustart
+   * heilt es nicht, weil der Status in der Datenbank liegt.
+   *
+   * Wiederhergestellt wird exakt die Invariante des Abschlusspfads: kein
+   * laufender Run => `idle`. Die Pruefung steckt als `not exists` im selben
+   * UPDATE, damit ein parallel startender Lauf nicht faelschlich auf `idle`
+   * gesetzt wird.
+   */
+  async function reconcileAgentRunningStatuses(opts?: { staleThresholdMs?: number }) {
+    const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const conditions = [eq(agents.status, "running")];
+    if (staleThresholdMs > 0) {
+      conditions.push(lte(agents.updatedAt, new Date(Date.now() - staleThresholdMs)));
+    }
+
+    const candidates = await db
+      .select({ id: agents.id, companyId: agents.companyId, name: agents.name })
+      .from(agents)
+      .where(and(...conditions));
+    if (candidates.length === 0) return [];
+
+    const reconciled: { id: string; companyId: string; name: string | null }[] = [];
+    for (const candidate of candidates) {
+      const updated = await db
+        .update(agents)
+        .set({ status: "idle", updatedAt: new Date() })
+        .where(and(
+          eq(agents.id, candidate.id),
+          eq(agents.status, "running"),
+          sql`not exists (
+            select 1 from ${heartbeatRuns}
+            where ${heartbeatRuns.agentId} = ${agents.id}
+              and ${heartbeatRuns.status} = running
+          )`,
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (updated) reconciled.push(candidate);
+    }
+    if (reconciled.length > 0) {
+      logger.info(
+        { count: reconciled.length, agentIds: reconciled.map((a) => a.id) },
+        "reconciled agents stuck in running without an active run",
+      );
+    }
+    return reconciled;
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     const cutoff = await getAutomaticExecutionCutoff();
@@ -17514,6 +17571,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    reconcileAgentRunningStatuses,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.

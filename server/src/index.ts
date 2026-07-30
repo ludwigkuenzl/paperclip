@@ -938,6 +938,15 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
+        // Der Reap raeumt nur die Laeufe auf. `agents.status` liegt in der
+        // Datenbank und ueberlebt jeden Neustart, weshalb ein Agent sonst
+        // dauerhaft als beschaeftigt gilt, obwohl kein Lauf mehr existiert.
+        try {
+          await heartbeat.reconcileAgentRunningStatuses();
+        } catch (err) {
+          logger.warn({ err }, "startup reconcile of stuck agent statuses failed - periodic pass will retry");
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
@@ -1083,6 +1092,7 @@ export async function startServer(): Promise<StartedServer> {
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+            .then(() => heartbeat.reconcileAgentRunningStatuses({ staleThresholdMs: 5 * 60 * 1000 }))
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();

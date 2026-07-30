@@ -8986,9 +8986,14 @@ export function issueRoutes(
       const leftDone = existing.status === "done" && issue.status !== "done";
       if (leftDone) {
         try {
+          // `blocks` sind genau die Vorgaenge, die auf diesen hier warten. Sie
+          // muessen mit entwertet werden, weil die Duplikatpruefung der
+          // Live-Route gegen alle Blockerschluessel eines Vorgangs laeuft.
+          const dependentRelations = await svc.getRelationSummaries(issue.id);
           const superseded = await supersedeIssueBlockersResolvedWakesForBlocker(db, {
             companyId: issue.companyId,
             blockerIssueId: issue.id,
+            dependentIssueIds: dependentRelations.blocks.map((relation) => relation.id),
           });
           if (superseded > 0) {
             logger.info(
