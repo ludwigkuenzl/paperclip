@@ -71,3 +71,59 @@ export async function findExistingIssueBlockersResolvedWakeForAnyKey(
     .limit(1)
     .then((rows) => rows[0] ?? null);
 }
+
+/**
+ * Entwertet die Dependency-Wakes eines Blockers, wenn dieser aus einem
+ * terminalen Zustand heraus wieder geoeffnet wird.
+ *
+ * Hintergrund: Der Idempotenzschluessel besteht nur aus abhaengigem Issue und
+ * Blocker-Issue. Er kennt keine Generation. Nach dem ersten Abschluss bleibt ein
+ * Wake mit Status `completed` stehen; wird der Blocker danach reopened und
+ * erneut fertig, bildet der Live-Pfad denselben Schluessel, findet den alten
+ * Eintrag und unterdrueckt den Wake. Der abhaengige Vorgang bleibt dann auf
+ * `blocked` stehen, obwohl sein Blocker erledigt ist - genau der stille
+ * Stillstand, der am 2026-07-30 im E2E-Test reproduziert wurde.
+ *
+ * Statt den Schluessel umzubauen (der Recovery-Backstop kennt nur Issue-IDs und
+ * koennte keinen passenden Generationsmarker bilden) wird beim Reopen der alte
+ * Schluessel umbenannt. Der Eintrag bleibt fuer den Audit-Trail erhalten, wird
+ * von der Idempotenzsuche aber nicht mehr gefunden, sodass der naechste echte
+ * Abschluss wieder einen Wake ausloest.
+ */
+export async function supersedeIssueBlockersResolvedWakesForBlocker(
+  db: Db,
+  input: {
+    companyId: string;
+    blockerIssueId: string;
+    supersededAt?: Date;
+  },
+) {
+  const suffix = `:superseded:${(input.supersededAt ?? new Date()).toISOString()}`;
+  const rows = await db
+    .select({ id: agentWakeupRequests.id, idempotencyKey: agentWakeupRequests.idempotencyKey })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON),
+        inArray(agentWakeupRequests.status, [...IDEMPOTENT_DEPENDENCY_WAKE_STATUSES]),
+      ),
+    );
+
+  const marker = `:${input.blockerIssueId}`;
+  const affected = rows.filter(
+    (row) =>
+      typeof row.idempotencyKey === "string" &&
+      row.idempotencyKey.startsWith(`${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:`) &&
+      row.idempotencyKey.endsWith(marker),
+  );
+  if (affected.length === 0) return 0;
+
+  for (const row of affected) {
+    await db
+      .update(agentWakeupRequests)
+      .set({ idempotencyKey: `${row.idempotencyKey}${suffix}` })
+      .where(eq(agentWakeupRequests.id, row.id));
+  }
+  return affected.length;
+}

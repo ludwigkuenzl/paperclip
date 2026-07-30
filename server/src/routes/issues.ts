@@ -145,6 +145,7 @@ import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
+  supersedeIssueBlockersResolvedWakesForBlocker,
   findExistingIssueBlockersResolvedWake,
 } from "../services/issue-dependency-wakeups.js";
 import {
@@ -8975,6 +8976,31 @@ export function issueRoutes(
               source: "comment.mention",
             },
           });
+        }
+      }
+
+      // Verlaesst ein Blocker den Zustand `done`, wird sein frueherer
+      // Dependency-Wake entwertet. Sonst unterdrueckt der Idempotenzschluessel
+      // (der keine Generation kennt) den Wake nach dem naechsten Abschluss, und
+      // der abhaengige Vorgang bleibt still auf `blocked` stehen.
+      const leftDone = existing.status === "done" && issue.status !== "done";
+      if (leftDone) {
+        try {
+          const superseded = await supersedeIssueBlockersResolvedWakesForBlocker(db, {
+            companyId: issue.companyId,
+            blockerIssueId: issue.id,
+          });
+          if (superseded > 0) {
+            logger.info(
+              { issueId: issue.id, superseded, from: existing.status, to: issue.status },
+              "superseded stale dependency wakes after blocker left done",
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: issue.id },
+            "failed to supersede dependency wakes after blocker left done",
+          );
         }
       }
 

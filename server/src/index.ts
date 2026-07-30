@@ -628,11 +628,38 @@ export async function startServer(): Promise<StartedServer> {
       const generalSettings = await backupSettingsSvc.getGeneral();
       const retention = generalSettings.backupRetention;
 
-      const result = await runDatabaseBackup({
-        connectionString: activeDatabaseConnectionString,
-        backupDir: config.databaseBackupDir,
-        retention,
-        filenamePrefix: "paperclip",
+      // Ohne Zeitgrenze haengt ein nicht zurueckkehrender Dump den Runner
+      // dauerhaft: `databaseBackupInFlight` wird nur im `finally` zurueckgesetzt,
+      // und das greift nie, wenn das Promise nicht aufloest. Genau so stand das
+      // stuendliche Backup vom 2026-07-23 bis 2026-07-30 still, ohne dass ein
+      // pg_dump-Prozess noch existierte. Die Grenze ist bewusst grosszuegig
+      // gegenueber der realen Laufzeit von rund acht Sekunden.
+      const backupTimeoutMs = Math.max(
+        60_000,
+        Number(process.env.PAPERCLIP_DATABASE_BACKUP_TIMEOUT_MS ?? 30 * 60_000) || 30 * 60_000,
+      );
+      let backupTimeoutHandle: NodeJS.Timeout | undefined;
+      const result = await Promise.race([
+        runDatabaseBackup({
+          connectionString: activeDatabaseConnectionString,
+          backupDir: config.databaseBackupDir,
+          retention,
+          filenamePrefix: "paperclip",
+        }),
+        new Promise<never>((_resolve, reject) => {
+          backupTimeoutHandle = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `database backup exceeded ${backupTimeoutMs}ms and was abandoned so the runner stays available`,
+                ),
+              ),
+            backupTimeoutMs,
+          );
+          backupTimeoutHandle.unref?.();
+        }),
+      ]).finally(() => {
+        if (backupTimeoutHandle) clearTimeout(backupTimeoutHandle);
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
