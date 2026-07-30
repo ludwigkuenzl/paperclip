@@ -12,6 +12,8 @@ const IDEMPOTENT_DEPENDENCY_WAKE_STATUSES = [
   "completed",
 ] as const;
 
+const SUPERSEDED_MARKER = ":superseded:";
+
 export function buildIssueBlockersResolvedWakeIdempotencyKey(input: {
   dependentIssueId: string;
   resolvedBlockerIssueId: string;
@@ -109,7 +111,7 @@ export async function supersedeIssueBlockersResolvedWakesForBlocker(
     supersededAt?: Date;
   },
 ) {
-  const suffix = `:superseded:${(input.supersededAt ?? new Date()).toISOString()}`;
+  const suffix = `${SUPERSEDED_MARKER}${(input.supersededAt ?? new Date()).toISOString()}`;
   const rows = await db
     .select({ id: agentWakeupRequests.id, idempotencyKey: agentWakeupRequests.idempotencyKey })
     .from(agentWakeupRequests)
@@ -129,6 +131,10 @@ export async function supersedeIssueBlockersResolvedWakesForBlocker(
     const key = row.idempotencyKey;
     if (typeof key !== "string") return false;
     if (!key.startsWith(`${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:`)) return false;
+    // Bereits entwertete Zeilen nicht erneut anfassen. Sie sperren nichts mehr,
+    // und ein zweiter Suffix wuerde den Schluessel bei jedem weiteren
+    // Reopen-Zyklus unbegrenzt wachsen lassen und die Zaehlung verfaelschen.
+    if (key.includes(SUPERSEDED_MARKER)) return false;
     // Dieser Vorgang war selbst der aufgeloeste Blocker.
     if (key.endsWith(blockerMarker)) return true;
     // Oder die Zeile gehoert zu einem seiner abhaengigen Vorgaenge und wurde von
